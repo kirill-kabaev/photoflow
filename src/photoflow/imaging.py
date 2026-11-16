@@ -12,7 +12,7 @@ from PIL import Image, ImageCms, ImageDraw, __version__ as pillow_version
 from scipy.ndimage import gaussian_filter
 
 from .models import RawSettings, Recipe
-from .storage import FlowError
+from .storage import FlowError, write_json
 
 
 @dataclass
@@ -219,6 +219,32 @@ def save_previews(before, after, folder, max_edge=1400):
         with Image.open(folder / name) as test:
             test.verify()
     return {"preview_dimensions": list(left.size), "comparison_dimensions": list(combined.size)}
+
+
+def save_details(before, after, source_shape, recipe, folder):
+    """Native-resolution crops from processed float pixels, never from JPEG previews."""
+    height, width = source_shape[:2]
+    offset_x, offset_y = int(recipe.crop.left * width), int(recipe.crop.top * height)
+    details = {}
+    for region in recipe.detail_regions:
+        b = region.bounds
+        source_box = [int(b.left * width), int(b.top * height),
+                      int(b.right * width), int(b.bottom * height)]
+        x1, y1, x2, y2 = source_box
+        x1, x2 = x1 - offset_x, x2 - offset_x
+        y1, y2 = y1 - offset_y, y2 - offset_y
+        if (x2 <= x1 or y2 <= y1 or x1 < 0 or y1 < 0
+                or x2 > after.shape[1] or y2 > after.shape[0] or before.shape != after.shape):
+            raise FlowError(f"Invalid detail crop at source resolution: {region.id}")
+        target = folder / "details" / region.id
+        target.mkdir(parents=True, exist_ok=False)
+        metadata = save_previews(before[y1:y2, x1:x2], after[y1:y2, x1:x2], target,
+                                 max_edge=max(x2 - x1, y2 - y1))
+        metadata.update(source_box=source_box, bounds=b.model_dump(), scale=1.0,
+                        description=region.description, source="full-resolution linear RGB, before JPEG encoding")
+        write_json(target / "region.json", metadata)
+        details[region.id] = metadata
+    return details
 
 
 def export_pixels(linear, jpeg, tiff, quality):

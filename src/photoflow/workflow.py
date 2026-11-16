@@ -2,13 +2,14 @@
 import json
 import os
 import re
+import uuid
 from pathlib import Path
 
 from . import __version__
 from . import imaging, queue as queues, reporting
-from .models import (AIReview, ExportManifest, Plan, RawSettings, Recipe, Region,
-                     SessionStyle, VersionManifest)
-from .storage import (FlowError, checked_version, digest, now,
+from .models import (AIReview, DetailRegion, ExportManifest, Plan, RawSettings, Recipe, Region,
+                     RevisionRequest, SessionStyle, VersionManifest)
+from .storage import (FlowError, atomic_write, checked_version, digest, now,
                       read_model, sync_dir, write_json)
 
 
@@ -74,8 +75,8 @@ class Workflow:
         preview = self.session.work(photo.id, "analysis_preview.jpg")
         if plan.analysis.preview_sha256 != context["preview_sha256"] or digest(preview) != context["preview_sha256"]:
             raise FlowError("Analysis is not bound to current visual input")
-        if plan.recipe.parent_version != photo.current_version:
-            raise FlowError("Recipe parent must be current version")
+        if plan.recipe.parent_version != self.revision_parent(photo):
+            raise FlowError("Recipe parent must match the requested revision base")
         if photo.state == "revision_requested":
             self.check_feedback(photo, plan.recipe)
         elif plan.recipe.feedback_sha256 is not None or plan.recipe.feedback_applied:
@@ -89,9 +90,17 @@ class Workflow:
         return {"photo_id": photo.id, "state": photo.state, "provider": plan.analysis.provider}
 
     def check_feedback(self, photo, recipe):
-        feedback = self.session.work(photo.id, photo.current_version, "feedback.md")
+        feedback = self.feedback_path(photo)
         if not recipe.feedback_applied.strip() or recipe.feedback_sha256 != digest(feedback):
             raise FlowError("Revision must explain feedback and reference the current feedback.md checksum")
+
+    def revision_parent(self, photo):
+        return photo.revision_request.parent_version if photo.revision_request else photo.current_version
+
+    def feedback_path(self, photo):
+        relative = (photo.revision_request.feedback_path if photo.revision_request
+                    else f"{photo.current_version}/feedback.md")
+        return self.session.work(photo.id, relative)
 
     def version_folder(self, photo, version):
         checked_version(version)
@@ -113,6 +122,8 @@ class Workflow:
             raise FlowError("Version recipe identity invalid")
         if recipe.parent_version != manifest["parent_version"] or recipe.masks != [Region.model_validate(m) for m in manifest["masks"]]:
             raise FlowError("Version recipe/mask manifest mismatch")
+        if recipe.detail_regions != [DetailRegion.model_validate(r) for r in manifest["detail_regions"]]:
+            raise FlowError("Version recipe/detail manifest mismatch")
         for name in ["report.md", "feedback.md", "ai_review.json"]:
             if not self.session.work(photo.id, version, name).is_file():
                 raise FlowError(f"Mandatory version artifact missing: {name}")
@@ -134,12 +145,12 @@ class Workflow:
         original_photo = photo.model_copy(deep=True)
         plan = read_model(self.session.work(photo.id, "plan.json"), Plan)
         recipe = plan.recipe
-        if recipe.parent_version != photo.current_version:
+        if recipe.parent_version != self.revision_parent(photo):
             raise FlowError("Stale plan parent version")
         if recipe.photo_id != photo.id or recipe.source_sha256 != photo.source_sha256:
             raise FlowError("Plan identity changed")
-        if photo.current_version:
-            self.validate_version(photo, photo.current_version)
+        if recipe.parent_version:
+            self.validate_version(photo, recipe.parent_version)
             self.check_feedback(photo, recipe)
         version = self.next_version(photo)
         temporary = self.session.work(photo.id, f".staging-{version}")
@@ -167,13 +178,14 @@ class Workflow:
             before = imaging.crop_image(baseline.pixels, recipe.crop)
             measures = {"before": imaging.metrics(before), "after": imaging.metrics(result)}
             measures.update(imaging.save_previews(before, result, temporary))
+            measures["details"] = imaging.save_details(before, result, baseline.pixels.shape, recipe, temporary)
             write_json(temporary / "metrics.json", measures)
             reporting.text(temporary / "feedback.md", f"# Обратная связь — {photo.filename} {version}\n\nStatus: review\n\n## Запрошенные изменения\n\n")
             write_json(temporary / "ai_review.json", {"status": "awaiting_codex_visual_review"})
             if recipe.parent_version:
                 # Exact historical feedback snapshot, independent of future user edits.
                 reporting.text(temporary / "feedback_applied.md",
-                               self.session.work(photo.id, recipe.parent_version, "feedback.md").read_text())
+                               self.feedback_path(photo).read_text())
             self.session.source(photo)  # Verify RAW integrity again after all processing.
             mutable = {"feedback.md", "ai_review.json", "report.md", "manifest.json"}
             artifacts = {str(p.relative_to(temporary)): digest(p) for p in sorted(temporary.rglob("*"))
@@ -184,6 +196,7 @@ class Workflow:
                         "engine_version": __version__, "libraries": imaging.runtime_versions(),
                         "ai": {"provider": plan.analysis.provider, "model": plan.analysis.model},
                         "masks": [m.model_dump() for m in recipe.masks], "created_at": now(),
+                        "detail_regions": [r.model_dump() for r in recipe.detail_regions],
                         "artifacts": artifacts, "mutable_artifacts": sorted(mutable - {"manifest.json"})}
             write_json(temporary / "manifest.json", VersionManifest.model_validate_json(json.dumps(manifest)))
             # Publish only after all mandatory artifacts, including report, exist.
@@ -195,6 +208,7 @@ class Workflow:
             os.rename(temporary, destination)
             sync_dir(destination.parent)
             photo.operation_version = None
+            photo.revision_request = None
             self.save()
             return {"photo_id": photo.id, "version": version, "state": photo.state,
                     "report": str(destination / "report.md"), "ai_review": "pending"}
@@ -207,21 +221,32 @@ class Workflow:
             self.fail(photo, exc)
             raise
 
-    def request_revision(self, identifier):
+    def request_revision(self, identifier, from_version=None, feedback_file=None):
         photo = self.photo(identifier)
         if not photo.current_version:
             raise FlowError("No version to revise")
-        self.validate_version(photo, photo.current_version)
+        base = from_version or self.revision_parent(photo)
+        self.validate_version(photo, base)
         if photo.state not in {"review", "approved", "exported", "failed", "revision_requested"}:
             raise FlowError("Cannot request revision from current state")
+        if from_version or feedback_file or photo.revision_request is None:
+            feedback_relative = f"{base}/feedback.md"
+            if feedback_file is not None:
+                content = Path(feedback_file).read_bytes()
+                if not content.decode("utf-8").strip():
+                    raise FlowError("Feedback file must contain a request")
+                feedback_relative = f"revision_requests/{uuid.uuid4().hex}.md"
+                atomic_write(self.session.work(photo.id, feedback_relative), content)
+            photo.revision_request = RevisionRequest(parent_version=base,
+                                                     feedback_path=feedback_relative, requested_at=now())
         if photo.state != "revision_requested":
             queues.transition(photo, "revision_requested", "User/Codex requested a revision; interpret persisted feedback")
         self.save()
-        feedback = self.session.work(photo.id, photo.current_version, "feedback.md")
-        return {"photo_id": photo.id, "parent_version": photo.current_version,
+        feedback = self.feedback_path(photo)
+        return {"photo_id": photo.id, "parent_version": base,
                 "feedback_file": str(feedback), "feedback_sha256": digest(feedback),
                 "feedback": feedback.read_text(),
-                "previous_recipe": str(self.session.work(photo.id, photo.current_version, "recipe.json")),
+                "previous_recipe": str(self.session.work(photo.id, base, "recipe.json")),
                 "instruction": "Inspect current result, interpret feedback, write revised Plan and import-plan; no automatic NLP in Python"}
 
     def review(self, identifier, path=None):
@@ -339,6 +364,7 @@ class Workflow:
                     else:
                         photo.versions = candidate.versions
                         photo.current_version = version
+                        photo.revision_request = None
                         photo.approved_version = photo.approved_recipe_sha256 = photo.approved_by = photo.approved_at = None
                         queues.transition(photo, "review", "Recovered complete immutable version after interrupted queue update")
                         reporting.version_report(self.session, photo, version)

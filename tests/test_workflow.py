@@ -280,3 +280,40 @@ def test_recovery_does_not_register_corrupt_published_version(workflow):
     p = queue.load(workflow.session).photos[0]
     assert p.versions == [] and p.current_version is None
     assert workflow.session.work(photo.id, "v001").is_dir()  # Evidence is preserved.
+
+
+def test_candidates_branch_from_same_parent_without_mutating_its_files(workflow):
+    photo = process_first(workflow)
+    v001 = workflow.session.work(photo.id, "v001")
+    historical = {str(p.relative_to(v001)): digest(p) for p in v001.rglob("*") if p.is_file()}
+    external = workflow.session.path("candidate-feedback.md")
+    external.write_text("Rejected v001. Create distinct A/B/C candidates without modifying v001.")
+    for exposure, expected_version in [(0.5, "v002"), (0.7, "v003")]:
+        request = workflow.request_revision(photo.id, from_version="v001", feedback_file=external)
+        assert request["parent_version"] == "v001"
+        assert external.read_text() == Path(request["feedback_file"]).read_text()
+        path = make_plan(workflow, photo, parent="v001", exposure=exposure, feedback=Path(request["feedback_file"]))
+        workflow.import_plan(photo.id, path)
+        assert workflow.process(photo.id)["version"] == expected_version
+        folder = workflow.session.work(photo.id, expected_version)
+        assert json.loads((folder / "manifest.json").read_text())["parent_version"] == "v001"
+        assert (folder / "feedback_applied.md").read_text() == external.read_text()
+        assert photo.revision_request is None
+    assert {str(p.relative_to(v001)): digest(p) for p in v001.rglob("*") if p.is_file()} == historical
+
+
+def test_detail_artifacts_are_required_and_integrity_checked(workflow):
+    photo = workflow.queue.photos[0]
+    workflow.prepare(photo.id)
+    path = make_plan(workflow, photo)
+    data = json.loads(path.read_text())
+    data["recipe"]["detail_regions"] = [{"id": "face", "bounds": {"left": 0.2, "top": 0.2, "right": 0.8, "bottom": 0.8}, "description": "Synthetic ROI"}]
+    write_json(path, data)
+    workflow.import_plan(photo.id, path)
+    workflow.process(photo.id)
+    folder, _, manifest = workflow.validate_version(photo, "v001")
+    assert "details/face/after.jpg" in manifest["artifacts"]
+    assert "details/face/before_after.jpg" in (folder / "report.md").read_text()
+    (folder / "details/face/after.jpg").write_bytes(b"corrupt detail")
+    with pytest.raises(FlowError, match="artifact modified"):
+        workflow.validate_version(photo, "v001")

@@ -64,6 +64,11 @@ def version_report(session, photo, version, folder=None):
     masks = [f"{m.id}: эллипс {m.center}, радиусы {m.radius}, растушёвка {m.feather}. {m.description}" for m in recipe.masks]
     operations = [f"{a.mask}: {a.operation} = {a.amount}. {a.rationale}" for a in recipe.local_adjustments]
     overlays = "\n\n".join(f"![Маска {m.id}](./masks/{m.id}-overlay.jpg)" for m in recipe.masks)
+    details = "\n\n".join(
+        f"### {r.id}: {r.description}\n\n"
+        f"[До](./details/{r.id}/before.jpg) · [После](./details/{r.id}/after.jpg) · "
+        f"[Координаты и размер](./details/{r.id}/region.json)\n\n"
+        f"![Детали {r.id}](./details/{r.id}/before_after.jpg)" for r in recipe.detail_regions)
     report = f"""# {photo.filename} — {version}
 
 Сессия: {session.root.name}. Текущий статус фотографии: **{photo.state}**.
@@ -114,6 +119,13 @@ RAW: `{recipe.raw.model_dump_json()}`. Crop: `{recipe.crop.model_dump_json()}`.
 ## Визуальная AI-проверка
 
 {review}
+
+## Детальные кропы без увеличения
+
+Кропы получены из полноразмерных float32-данных до JPEG-кодирования, масштаб 1:1.
+На экране Markdown они могут отображаться уменьшенными; откройте отдельное «После» для 100%.
+
+{details or 'Детальные области не заданы в рецепте.'}
 
 ## Измерения Python
 

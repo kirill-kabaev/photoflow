@@ -32,6 +32,9 @@ def parser():
         if name == "approve":
             command.add_argument("--version", required=True)
             command.add_argument("--by", required=True, help="Approving user; only after their explicit request")
+        if name == "revise":
+            command.add_argument("--from-version", help="Branch from a registered version, preserving previous candidates")
+            command.add_argument("--feedback-file", type=Path, help="Snapshot external feedback without changing historical version files")
         if name == "priority":
             command.add_argument("--value", type=int, required=True)
             command.add_argument("--reason", required=True)
@@ -88,7 +91,7 @@ def execute(args):
         if args.command == "review":
             return workflow.review(args.photo)
         if args.command == "revise":
-            return workflow.request_revision(args.photo)
+            return workflow.request_revision(args.photo, args.from_version, args.feedback_file)
         if args.command == "approve":
             return workflow.approve(args.photo, args.version, args.by)
         if args.command == "export":

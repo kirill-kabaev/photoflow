@@ -99,6 +99,13 @@ class Output(StrictModel):
     tiff_bits: Literal[16] = 16
 
 
+class DetailRegion(StrictModel):
+    """Unscaled inspection crop in oriented, uncropped source coordinates."""
+    id: Identifier
+    bounds: Crop
+    description: Text
+
+
 class Recipe(StrictModel):
     schema_version: Literal[1] = 1
     photo_id: Identifier
@@ -110,6 +117,7 @@ class Recipe(StrictModel):
     global_adjustments: GlobalAdjustments = GlobalAdjustments()
     masks: Annotated[list[Region], Field(max_length=32)] = []
     local_adjustments: Annotated[list[LocalAdjustment], Field(max_length=64)] = []
+    detail_regions: Annotated[list[DetailRegion], Field(max_length=12)] = []
     crop: Crop = Crop()
     output: Output = Output()
     rationale: Text
@@ -124,6 +132,13 @@ class Recipe(StrictModel):
             raise ValueError("duplicate mask IDs")
         if any(a.mask not in ids for a in self.local_adjustments):
             raise ValueError("local adjustment references unknown mask")
+        detail_ids = [region.id for region in self.detail_regions]
+        if len(set(detail_ids)) != len(detail_ids):
+            raise ValueError("duplicate detail region IDs")
+        for region in self.detail_regions:
+            b, c = region.bounds, self.crop
+            if b.left < c.left or b.top < c.top or b.right > c.right or b.bottom > c.bottom:
+                raise ValueError("detail region must be contained in the output crop")
         return self
 
 
@@ -170,6 +185,12 @@ class AIReview(StrictModel):
     rationale: Text
 
 
+class RevisionRequest(StrictModel):
+    parent_version: Version
+    feedback_path: Annotated[str, Field(pattern=r"^(?:v[0-9]{3,}/feedback\.md|revision_requests/[0-9a-f]{32}\.md)$")]
+    requested_at: str
+
+
 class Photo(StrictModel):
     id: Identifier
     filename: str
@@ -183,6 +204,7 @@ class Photo(StrictModel):
     approved_by: str | None = None
     approved_at: str | None = None
     operation_version: Version | None = None
+    revision_request: RevisionRequest | None = None
     priority: int = 0
     error: str | None = None
     updated_at: str
@@ -196,6 +218,8 @@ class Photo(StrictModel):
             raise ValueError("current version is not registered")
         if self.approved_version and self.approved_version not in self.versions:
             raise ValueError("approved version is not registered")
+        if self.revision_request and self.revision_request.parent_version not in self.versions:
+            raise ValueError("revision parent is not registered")
         if self.state in {"approved", "exporting", "exported"} and not all([
             self.approved_version, self.approved_recipe_sha256, self.approved_by, self.approved_at
         ]):
@@ -242,6 +266,7 @@ class VersionManifest(StrictModel):
     libraries: dict
     ai: dict[str, str]
     masks: list[Region]
+    detail_regions: list[DetailRegion] = []
     created_at: Text
     artifacts: dict[str, Checksum]
     mutable_artifacts: list[str]
@@ -255,6 +280,11 @@ class VersionManifest(StrictModel):
         for mask in self.masks:
             if not {f"masks/{mask.id}.npy", f"masks/{mask.id}-overlay.jpg"} <= self.artifacts.keys():
                 raise ValueError("Version manifest is missing mask artifacts")
+        for region in self.detail_regions:
+            required_detail = {f"details/{region.id}/{name}" for name in
+                               ["before.jpg", "after.jpg", "before_after.jpg", "region.json"]}
+            if not required_detail <= self.artifacts.keys():
+                raise ValueError("Version manifest is missing detail artifacts")
         return self
 
 

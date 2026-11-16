@@ -33,3 +33,24 @@ def test_real_raw_decode_process_export_and_immutability(tmp_path):
     result = imaging.export_pixels(processed, tmp_path / "output.jpg", tmp_path / "output.tif", 95)
     assert result["tiff_bits_per_channel"] == 16
     assert digest(path) == before
+
+
+@pytest.mark.raw
+def test_real_raw_linear_pipeline_agrees_with_independent_libraw_srgb():
+    sample = os.environ.get("PHOTOFLOW_RAW_SAMPLE")
+    if not sample:
+        pytest.skip("Set PHOTOFLOW_RAW_SAMPLE for independent LibRaw transfer-function check")
+    import rawpy
+    path = Path(sample)
+    checksum = digest(path)
+    decoded = imaging.decode_raw(path, RawSettings())
+    expected = imaging.encode_srgb(decoded.pixels[::16, ::16])
+    del decoded
+    with rawpy.imread(str(path)) as raw:
+        reference = raw.postprocess(output_bps=16, output_color=rawpy.ColorSpace.sRGB,
+            gamma=(2.4, 12.92), no_auto_bright=True, bright=1.0,
+            use_camera_wb=True, use_auto_wb=False, highlight_mode=rawpy.HighlightMode.Clip,
+            demosaic_algorithm=rawpy.DemosaicAlgorithm.AHD)
+    measured = reference[::16, ::16].astype(np.float32) / 65535
+    assert np.max(np.abs(expected - measured)) < 3 / 65535
+    assert digest(path) == checksum
