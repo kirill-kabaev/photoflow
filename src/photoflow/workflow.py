@@ -282,6 +282,9 @@ class Workflow:
                 write_json(temporary / "segmentation.json",semantics.manifest)
             result = imaging.process_pixels(decoded.pixels, recipe, temporary / "masks",semantic_provider=semantics,
                 healing_provider=healing, healing_dir=temporary / "healing" if healing else None)
+            # Preserve the developed pixels for explicit export without rerendering.
+            import numpy as np
+            np.save(temporary / 'full_result.npy',result,allow_pickle=False)
             before = imaging.crop_image(baseline.pixels, recipe.crop,recipe.approved_crop)
             measures = {"before": imaging.metrics(before), "after": imaging.metrics(result)}
             measures.update(imaging.save_previews(before, result, temporary))

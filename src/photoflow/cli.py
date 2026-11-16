@@ -32,6 +32,11 @@ def parser():
         if name == "approve":
             command.add_argument("--version", required=True)
             command.add_argument("--by", required=True, help="Approving user; only after their explicit request")
+        if name == 'export':
+            command.add_argument('--force',action='store_true',help='Explicit manual JPEG export from saved full-resolution result; no AI review or approval implied')
+            command.add_argument('--version')
+            command.add_argument('--by')
+            command.add_argument('--reason')
         if name == "revise":
             command.add_argument("--from-version", help="Branch from a registered version, preserving previous candidates")
             command.add_argument("--feedback-file", type=Path, help="Snapshot external feedback without changing historical version files")
@@ -207,6 +212,11 @@ def execute(args):
         if args.command == "approve":
             return workflow.approve(args.photo, args.version, args.by)
         if args.command == "export":
+            if args.force:
+                from .manual_export import export_saved
+                return export_saved(workflow,args.photo,args.version,args.by,args.reason)
+            if args.version or args.by or args.reason:
+                raise FlowError('Manual export parameters require --force')
             return workflow.export(args.photo)
         if args.command == "priority":
             photo = workflow.photo(args.photo)
