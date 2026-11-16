@@ -1,4 +1,4 @@
-# Инженерный отчёт PhotoFlow — 16.11.2026
+# Отчёт о реализации этапа 1 PhotoFlow — 16.11.2026
 
 ## Результат текущего этапа
 
@@ -156,7 +156,7 @@ RAW integration test действительно использует LibRaw, п�
 - `docs/ai_workflow.md`;
 - `docs/processing_pipeline.md`;
 - `docs/quality_control.md`;
-- `docs/PROGRESS.md`.
+- `docs/implemented_stage_1.md`.
 
 `docs/MASTER_PLAN.md` прочитан полностью и не изменён; он включён в начальный локальный
 коммит как исходная спецификация. Сгенерированные session queue/style/review/work
@@ -188,6 +188,9 @@ RAW integration test действительно использует LibRaw, п�
 Критерии — в ROADMAP, этап 2. Затем — отдельный opt-in API Director с бюджетами.
 
 ## Запуск и Git
+
+Коммит реализации этапа: `b2abf4130342aa97f186e231a2d623143fecc640` —
+`Implement verified Codex-assisted RAW workflow and approval-gated export`.
 
 Пакет уже установлен editable в `.venv`. Примеры:
 
