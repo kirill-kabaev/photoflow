@@ -10,7 +10,7 @@ from pathlib import Path
 from . import __version__
 from . import imaging, queue as queues, reporting
 from .cache import RawCache
-from .models import (AIReview, DetailRegion, ExportManifest, Plan, RawSettings, Recipe, Region,
+from .models import (AIReview, Crop, DetailRegion, ExportManifest, Plan, RawSettings, Recipe, Region,
                      ProcessingCycle, RenderAttempt, RevisionRequest, SessionStyle, VersionManifest)
 from .storage import (FlowError, atomic_write, checked_version, digest, json_bytes, now,
                       read_model, sync_dir, write_json)
@@ -53,6 +53,43 @@ class Workflow:
 
     def photo(self, identifier):
         return queues.find(self.queue, identifier)
+
+    def healing_provider(self, photo, recipe):
+        from .healing import HealingProvider, authorization
+        verified = authorization(self, photo, recipe)
+        return HealingProvider(verified, self.semantic_cache(photo, recipe)) if verified else None
+
+    def plan_defaults(self, plan):
+        from .models import NaturalSkinRetouch
+        # Revisions inherit the recorded setting, including legacy/off. Healing
+        # consent cannot enable an unrelated retouch operation.
+        if plan.recipe.natural_skin is None:
+            if plan.recipe.parent_version:
+                _, parent, _ = self.validate_version(self.photo(plan.recipe.photo_id),plan.recipe.parent_version)
+                plan.recipe.natural_skin = parent.natural_skin
+            else:
+                plan.recipe.natural_skin = NaturalSkinRetouch()
+        director=self.session.path('director','current.json')
+        if director.exists():
+            run=json.loads(director.read_text())
+            if run.get('status')=='active' and run.get('active')==plan.recipe.photo_id and run.get('config',{}).get('smart_crop'):
+                from .cropping import checkpoint,apply_selection
+                selected=checkpoint(self,self.photo(plan.recipe.photo_id))
+                if selected['action']!='crop_selected':
+                    raise FlowError('Show crop proposals and wait for explicit user selection before importing/rendering a plan')
+                plan=apply_selection(plan,selected)
+        return plan
+
+    def validate_crop(self, photo, recipe):
+        from .cropping import authorization
+        if recipe.approved_crop:
+            return authorization(self,photo,recipe)
+        previous = self.validate_version(photo,recipe.parent_version)[1] if recipe.parent_version else None
+        if recipe.crop != (previous.crop if previous else Crop()):
+            raise FlowError('A new crop requires explicit user approval of 16:9 or 9:16')
+        if previous and previous.approved_crop:
+            raise FlowError('Preserve the approved crop binding when revising this version')
+        return None
 
     def save(self):
         queues.save(self.session, self.queue)
@@ -101,7 +138,7 @@ class Workflow:
         photo = self.photo(identifier)
         if photo.state not in {"analyzing", "revision_requested"}:
             raise FlowError("Plan import requires analyzing or revision_requested state")
-        plan = read_model(Path(path), Plan)
+        plan = self.plan_defaults(read_model(Path(path), Plan))
         if photo.directed:
             from .director import validate_complete_plan
             validate_complete_plan(self, photo, plan)
@@ -119,6 +156,8 @@ class Workflow:
         elif plan.recipe.feedback_sha256 is not None or plan.recipe.feedback_applied:
             raise FlowError("Initial recipe cannot claim feedback")
         self.semantic_cache(photo,plan.recipe)
+        self.healing_provider(photo,plan.recipe)
+        self.validate_crop(photo,plan.recipe)
         # Keep one coherent plan as source of truth; analysis views are derived.
         write_json(self.session.work(photo.id, "plan.json"), plan)
         write_json(self.session.work(photo.id, "analysis.json"), plan.analysis)
@@ -166,6 +205,12 @@ class Workflow:
             raise FlowError("Version semantic mask manifest mismatch")
         if (recipe.segmentation.model_dump(mode="json") if recipe.segmentation else None) != manifest["segmentation"]:
             raise FlowError("Version segmentation manifest mismatch")
+        if (recipe.spot_healing.model_dump(mode="json") if recipe.spot_healing else None) != manifest["spot_healing"]:
+            raise FlowError("Version healing consent manifest mismatch")
+        if (recipe.natural_skin.model_dump(mode="json") if recipe.natural_skin else None) != manifest["natural_skin"]:
+            raise FlowError("Version skin retouch manifest mismatch")
+        if (recipe.approved_crop.model_dump(mode="json") if recipe.approved_crop else None) != manifest['approved_crop']:
+            raise FlowError('Version crop approval manifest mismatch')
         for name in ["report.md", "feedback.md", "ai_review.json"]:
             if not self.session.work(photo.id, version, name).is_file():
                 raise FlowError(f"Mandatory version artifact missing: {name}")
@@ -187,7 +232,7 @@ class Workflow:
         if photo.active_attempt_count >= photo.active_pass_limit:
             raise FlowError("Full-resolution pass limit reached; stop and present the best available version")
         original_photo = photo.model_copy(deep=True)
-        plan = read_model(self.session.work(photo.id, "plan.json"), Plan)
+        plan = self.plan_defaults(read_model(self.session.work(photo.id, "plan.json"), Plan))
         if photo.directed:
             from .director import validate_complete_plan
             validate_complete_plan(self, photo, plan)
@@ -200,6 +245,8 @@ class Workflow:
             self.validate_version(photo, recipe.parent_version)
             self.check_feedback(photo, recipe)
         semantics = self.semantic_cache(photo,recipe)
+        healing = self.healing_provider(photo,recipe)
+        crop_consent = self.validate_crop(photo,recipe)
         version = self.next_version(photo)
         temporary = self.session.work(photo.id, f".staging-{version}")
         destination = self.session.work(photo.id, version)
@@ -226,15 +273,24 @@ class Workflow:
             write_json(temporary / "decoder.json", decoded.metadata)
             style = read_model(self.session.path("session_style.json"), SessionStyle)
             write_json(temporary / "session_style.json", style)
+            if crop_consent:
+                for name in ['proposal.json','decision.json']:
+                    atomic_write(temporary/'cropping'/name,(crop_consent/name).read_bytes())
             if semantics:
                 if decoded.metadata["oriented_dimensions"] != semantics.manifest.dimensions:
                     raise FlowError("Segmentation/RAW oriented dimensions mismatch")
                 write_json(temporary / "segmentation.json",semantics.manifest)
-            result = imaging.process_pixels(decoded.pixels, recipe, temporary / "masks",semantic_provider=semantics)
-            before = imaging.crop_image(baseline.pixels, recipe.crop)
+            result = imaging.process_pixels(decoded.pixels, recipe, temporary / "masks",semantic_provider=semantics,
+                healing_provider=healing, healing_dir=temporary / "healing" if healing else None)
+            before = imaging.crop_image(baseline.pixels, recipe.crop,recipe.approved_crop)
             measures = {"before": imaging.metrics(before), "after": imaging.metrics(result)}
             measures.update(imaging.save_previews(before, result, temporary))
             measures["details"] = imaging.save_details(before, result, baseline.pixels.shape, recipe, temporary)
+            requested_skin = recipe.natural_skin is not None and recipe.natural_skin.enabled
+            available_skin = semantics is not None and semantics.manifest.regions.get('face_skin',{}).get('available',False)
+            measures['natural_skin'] = {'enabled':requested_skin,
+                'status':'applied' if requested_skin and available_skin else 'off' if not requested_skin else 'unavailable',
+                'note':'Chroma field only; luminance texture retained. No missing-mask fallback.'}
             measures["performance"] = {"elapsed_before_publish_seconds": perf_counter() - started,
                                        "raw_cache": cache.events, "full_pass": photo.active_attempt_count,
                                        "max_full_passes": photo.active_pass_limit,
@@ -258,6 +314,9 @@ class Workflow:
                         "masks": [m.model_dump() for m in recipe.masks], "created_at": now(),
                         "semantic_masks": [m.model_dump() for m in recipe.semantic_masks],
                         "segmentation": recipe.segmentation.model_dump() if recipe.segmentation else None,
+                        "spot_healing": recipe.spot_healing.model_dump() if recipe.spot_healing else None,
+                        "natural_skin": recipe.natural_skin.model_dump() if recipe.natural_skin else None,
+                        'approved_crop':recipe.approved_crop.model_dump() if recipe.approved_crop else None,
                         "detail_regions": [r.model_dump() for r in recipe.detail_regions],
                         "artifacts": artifacts, "mutable_artifacts": sorted(mutable - {"manifest.json"})}
             write_json(temporary / "manifest.json", VersionManifest.model_validate_json(json.dumps(manifest)))
@@ -375,6 +434,8 @@ class Workflow:
             raise FlowError("Approved recipe checksum mismatch")
         if manifest["libraries"] != imaging.runtime_versions():
             raise FlowError("Library versions changed since approval; create and review a new version")
+        healing = self.healing_provider(photo, recipe)
+        self.validate_crop(photo,recipe)
         names = [f"{photo.id}.jpg", f"{photo.id}.tif", f"{photo.id}.manifest.json"]
         destinations = [self.session.path("final", name) for name in names]
         if any(p.exists() for p in destinations):
@@ -389,7 +450,8 @@ class Workflow:
         try:
             source = self.session.source(photo)
             decoded = self.decoded(photo, recipe.raw)
-            result = imaging.process_pixels(decoded.pixels, recipe,semantic_provider=self.semantic_cache(photo,recipe))
+            result = imaging.process_pixels(decoded.pixels, recipe,semantic_provider=self.semantic_cache(photo,recipe),
+                                            healing_provider=healing)
             validation = imaging.export_pixels(result, staging / names[0], staging / names[1], recipe.output.jpeg_quality)
             self.session.source(photo)
             export_manifest = {"schema_version": 1, "photo_id": photo.id, "source_sha256": photo.source_sha256,

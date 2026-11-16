@@ -119,10 +119,27 @@ def _smooth(image, amount, sigma=1.0):
     return image + amount * edge_weight * (base - image)
 
 
-def crop_image(image, crop):
-    h, w = image.shape[:2]
-    x1, y1 = int(crop.left * w), int(crop.top * h)
-    x2, y2 = int(crop.right * w), int(crop.bottom * h)
+def crop_box(shape, crop, approved=None, preview=False):
+    h,w=shape[:2]
+    if approved:
+        if [w,h] == approved.dimensions:
+            return approved.source_box
+        if not preview:
+            raise FlowError('Approved crop/RAW oriented dimensions mismatch')
+        a,b=map(int,approved.aspect_ratio.split(':'))
+        ow,oh=approved.dimensions; x1,y1,x2,y2=approved.source_box
+        k=min(int((x2-x1)*w/ow)//a,int((y2-y1)*h/oh)//b)
+        if k<1:
+            raise FlowError('Preview is too small for exact crop aspect ratio')
+        cw,ch=a*k,b*k
+        left=max(0,min(w-cw,round((x1+x2)*w/ow/2-cw/2)))
+        top=max(0,min(h-ch,round((y1+y2)*h/oh/2-ch/2)))
+        return [left,top,left+cw,top+ch]
+    return [int(crop.left*w),int(crop.top*h),int(crop.right*w),int(crop.bottom*h)]
+
+
+def crop_image(image, crop, approved=None, preview=False):
+    x1,y1,x2,y2=crop_box(image.shape,crop,approved,preview)
     if x2 <= x1 or y2 <= y1:
         raise FlowError("Crop is empty at source resolution")
     return image[y1:y2, x1:x2].copy()
@@ -158,13 +175,19 @@ def _global_pixels(source, a, spatial_scale=1.0):
     return image
 
 
-def process_pixels(source, recipe: Recipe, mask_dir=None, preview_size=1400, spatial_scale=1.0, semantic_provider=None):
+def process_pixels(source, recipe: Recipe, mask_dir=None, preview_size=1400, spatial_scale=1.0, semantic_provider=None,
+                   healing_provider=None, healing_dir=None):
     if not 0 < spatial_scale <= 1:
         raise FlowError("Spatial preview scale must be in (0, 1]")
     if source.dtype != np.float32 or source.ndim != 3 or source.shape[2] != 3 or not np.isfinite(source).all():
         raise FlowError("Engine expects finite float32 RGB pixels")
     if recipe.semantic_masks and semantic_provider is None:
         raise FlowError("Semantic masks require a validated segmentation cache; no ellipse fallback")
+    if recipe.spot_healing and (healing_provider is None or spatial_scale != 1.0):
+        raise FlowError("Spot Healing requires verified explicit consent and native resolution")
+    if healing_provider is not None and (recipe.spot_healing is None
+            or healing_provider.proposal.id != recipe.spot_healing.request_id):
+        raise FlowError("Healing provider/recipe permission mismatch")
     image = np.empty_like(source, subok=False)
     # All global operators are pointwise except sigma-scaled Gaussian filters.
     # Two sequential filters require at most twice their four-sigma radius.
@@ -212,9 +235,17 @@ def process_pixels(source, recipe: Recipe, mask_dir=None, preview_size=1400, spa
             elif operation.operation == "smooth":
                 image += mask[..., None] * (_smooth(image, amount, spatial_scale) - image)
         del mask
+    if recipe.natural_skin and recipe.natural_skin.enabled and semantic_provider is not None:
+        if semantic_provider.manifest.regions.get('face_skin', {}).get('available'):
+            from .skin import natural_skin_retouch
+            skin = semantic_provider.mask('face_skin', image.shape)
+            natural_skin_retouch(image, skin, recipe.natural_skin, spatial_scale)
+            del skin
+    if recipe.spot_healing:
+        image = healing_provider.apply(image, healing_dir)
     if not np.isfinite(image).all():
         raise FlowError("Processing produced nonfinite pixels")
-    return crop_image(image.astype(np.float32, copy=False), recipe.crop)
+    return crop_image(image.astype(np.float32, copy=False), recipe.crop, recipe.approved_crop, preview=spatial_scale!=1.0)
 
 
 def to_preview(linear, max_edge=1400):
@@ -249,12 +280,19 @@ def save_previews(before, after, folder, max_edge=1400):
 def save_details(before, after, source_shape, recipe, folder):
     """Native-resolution crops from processed float pixels, never from JPEG previews."""
     height, width = source_shape[:2]
-    offset_x, offset_y = int(recipe.crop.left * width), int(recipe.crop.top * height)
+    offset_x,offset_y,_,_=crop_box(source_shape,recipe.crop,recipe.approved_crop)
     details = {}
     for region in recipe.detail_regions:
         b = region.bounds
         source_box = [int(b.left * width), int(b.top * height),
                       int(b.right * width), int(b.bottom * height)]
+        if recipe.approved_crop:
+            # At approved boundaries use exact native integers, avoiding a
+            # one-pixel loss from e.g. int((x/width)*width) == x-1.
+            frame=crop_box(source_shape,recipe.crop,recipe.approved_crop)
+            for i,key in enumerate(['left','top','right','bottom']):
+                if abs(getattr(b,key)-getattr(recipe.crop,key))<1e-12:
+                    source_box[i]=frame[i]
         x1, y1, x2, y2 = source_box
         x1, x2 = x1 - offset_x, x2 - offset_x
         y1, y2 = y1 - offset_y, y2 - offset_y

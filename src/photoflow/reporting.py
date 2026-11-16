@@ -107,6 +107,7 @@ highlight clip; тот же crop, что у результата. Превью �
 ```
 
 RAW: `{recipe.raw.model_dump_json()}`. Crop: `{recipe.crop.model_dump_json()}`.
+Точное одобренное кадрирование: `{recipe.approved_crop.model_dump_json() if recipe.approved_crop else 'нет'}`.
 
 ## Локальная ретушь и маски
 
@@ -131,6 +132,12 @@ RAW: `{recipe.raw.model_dump_json()}`. Crop: `{recipe.crop.model_dump_json()}`.
 На экране Markdown они могут отображаться уменьшенными; откройте отдельное «После» для 100%.
 
 {details or 'Детальные области не заданы в рецепте.'}
+
+Natural Skin Retouch: `{recipe.natural_skin.model_dump_json() if recipe.natural_skin else 'legacy/off'}`.
+{measures.get('natural_skin', {})}
+Выравнивается только медленное изменение цвета кожи, без размытия яркостной текстуры.
+
+{('Spot Healing: отдельный явный Yes; те же тональные настройки, native 100% до/после удаления.\n\n![Spot Healing](./healing/before_after.jpg)\n\n[Согласие](./healing/decision.json) · [Операция](./healing/operation.json)') if recipe.spot_healing else 'Spot Healing отключён; удаления точек нет.'}
 
 ## Измерения Python
 

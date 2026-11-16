@@ -143,3 +143,18 @@ Recipe фиксирует segmentation binding, version сохраняет segme
 overlays применённых alpha; review требует их фактические SHA. Chat bundle включает
 semantic overlays. Маски применяются в oriented uncropped RAW coordinates до crop.
 Подробности установки/ограничений: [semantic_segmentation.md](semantic_segmentation.md).
+
+## Отдельные решения о ретуши и crop
+
+`spot_healing_visual_review` требует настоящего осмотра кандидатов и `spot-review`:
+неуверенные точки отбрасываются, в том числе все. Только затем возможен
+`spot_healing_decision` с отдельным Yes/No для этого фото. Natural Skin Retouch
+независима и включается для новых планов по умолчанию при доступной face_skin.
+
+`direct --smart-crop` добавляет `crop_visual_analysis` → `crop_approval` перед
+первым full pass. Codex визуально заполняет CropAnalysis и через `crop-propose`
+показывает два варианта и оригинал. `crop-decision` записывается только после
+реального пользовательского выбора; следующий Plan получает approved pixel box.
+На уже обработанном фото применение crop создаёт новую версию и требует свободного
+слота; просмотр предложений слота не расходует. Финальный approval остаётся отдельным.
+Подробные команды и ограничения: [отчёт](implemented_skin_healing_cropping.md).

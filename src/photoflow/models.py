@@ -124,6 +124,34 @@ class DetailRegion(StrictModel):
     description: Text
 
 
+class SpotHealing(StrictModel):
+    """Permission reference only; target geometry comes from the verified proposal."""
+    request_id: Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]
+    decision_sha256: Checksum
+
+
+class NaturalSkinRetouch(StrictModel):
+    enabled: bool = True
+    tone_evenness: Annotated[float, Field(ge=0, le=0.25)] = 0.12
+    redness: Annotated[float, Field(ge=0, le=0.15)] = 0.04
+
+
+class ApprovedCrop(StrictModel):
+    request_id: Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]
+    decision_sha256: Checksum
+    aspect_ratio: Literal['16:9','9:16']
+    dimensions: Annotated[list[Annotated[int, Field(gt=0)]], Field(min_length=2,max_length=2)]
+    source_box: Annotated[list[Annotated[int, Field(ge=0)]], Field(min_length=4,max_length=4)]
+
+    @model_validator(mode='after')
+    def exact_geometry(self):
+        w,h=self.dimensions; x1,y1,x2,y2=self.source_box
+        a,b=map(int,self.aspect_ratio.split(':'))
+        if not (0<=x1<x2<=w and 0<=y1<y2<=h) or (x2-x1)*b != (y2-y1)*a:
+            raise ValueError('Approved crop must fit oriented RAW and have the exact aspect ratio')
+        return self
+
+
 class Recipe(StrictModel):
     schema_version: Literal[1] = 1
     photo_id: Identifier
@@ -136,9 +164,14 @@ class Recipe(StrictModel):
     masks: Annotated[list[Region], Field(max_length=32)] = []
     semantic_masks: Annotated[list[SemanticRegion], Field(max_length=32)] = []
     segmentation: SegmentationSettings | None = None
+    spot_healing: SpotHealing | None = None
+    # None preserves legacy recipes. Newly imported/explored plans get enabled
+    # defaults; explicit {enabled:false} is the reversible opt-out.
+    natural_skin: NaturalSkinRetouch | None = None
     local_adjustments: Annotated[list[LocalAdjustment], Field(max_length=64)] = []
     detail_regions: Annotated[list[DetailRegion], Field(max_length=12)] = []
     crop: Crop = Crop()
+    approved_crop: ApprovedCrop | None = None
     output: Output = Output()
     rationale: Text
     feedback_applied: str = ""
@@ -164,6 +197,11 @@ class Recipe(StrictModel):
             b, c = region.bounds, self.crop
             if b.left < c.left or b.top < c.top or b.right > c.right or b.bottom > c.bottom:
                 raise ValueError("detail region must be contained in the output crop")
+        if self.approved_crop:
+            w,h=self.approved_crop.dimensions
+            expected=[p/d for p,d in zip(self.approved_crop.source_box,[w,h,w,h])]
+            if any(abs(a-b)>1e-12 for a,b in zip(expected,[self.crop.left,self.crop.top,self.crop.right,self.crop.bottom])):
+                raise ValueError('Normalized crop differs from approved pixel coordinates')
         return self
 
 
@@ -204,7 +242,7 @@ class CorrectionRecommendation(StrictModel):
     expected_improvement: Text
     side_effects: list[Text]
     verification: Text
-    adjustment_paths: Annotated[list[Annotated[str, Field(pattern=r"^(?:global_adjustments\.(?:exposure_ev|highlights|shadows|black_point|white_point|contrast|saturation|vibrance|channel_gains|tone_curve|sharpen|denoise)|raw\.(?:white_balance|multipliers|highlight_mode)|masks|semantic_masks|segmentation|local_adjustments|crop)$")]], Field(min_length=1)]
+    adjustment_paths: Annotated[list[Annotated[str, Field(pattern=r"^(?:global_adjustments\.(?:exposure_ev|highlights|shadows|black_point|white_point|contrast|saturation|vibrance|channel_gains|tone_curve|sharpen|denoise)|raw\.(?:white_balance|multipliers|highlight_mode)|masks|semantic_masks|segmentation|local_adjustments|crop|approved_crop|spot_healing|natural_skin)$")]], Field(min_length=1)]
 
 
 class AIReview(StrictModel):
@@ -356,6 +394,9 @@ class VersionManifest(StrictModel):
     masks: list[Region]
     semantic_masks: list[SemanticRegion] = []
     segmentation: SegmentationSettings | None = None
+    spot_healing: SpotHealing | None = None
+    natural_skin: NaturalSkinRetouch | None = None
+    approved_crop: ApprovedCrop | None = None
     detail_regions: list[DetailRegion] = []
     created_at: Text
     artifacts: dict[str, Checksum]
@@ -376,6 +417,11 @@ class VersionManifest(StrictModel):
             for mask in self.semantic_masks:
                 if f"masks/{mask.id}-overlay.jpg" not in self.artifacts:
                     raise ValueError("Version manifest is missing semantic mask overlay")
+        if self.spot_healing and not {f"healing/{name}" for name in
+                ["before.jpg", "after.jpg", "before_after.jpg", "operation.json", "proposal.json", "decision.json"]} <= self.artifacts.keys():
+            raise ValueError("Version manifest is missing healing consent or native comparison")
+        if self.approved_crop and not {'cropping/proposal.json','cropping/decision.json'} <= self.artifacts.keys():
+            raise ValueError('Version manifest is missing crop approval')
         for region in self.detail_regions:
             required_detail = {f"details/{region.id}/{name}" for name in
                                ["before.jpg", "after.jpg", "before_after.jpg", "region.json"]}

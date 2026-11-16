@@ -25,6 +25,7 @@ class DirectorConfig(StrictModel):
     max_previews: Annotated[int, Field(ge=1, le=6)] = 3
     style: Text = "Natural Commercial Portrait"
     semantic: bool = False
+    smart_crop: bool = False
 
 
 class DirectorRun(StrictModel):
@@ -41,6 +42,7 @@ class DirectorRun(StrictModel):
     pending_bundle: str | None = None
     preview_ids: dict[str, list[str]] = {}
     initialized: list[Identifier] = []
+    spot_checks: dict[str, dict] = {}
     deliveries: list[dict] = []
     events: list[dict] = []
     created_at: str
@@ -53,7 +55,7 @@ def changed_adjustments(before, after):
         for key, value in getattr(before, group).model_dump().items():
             if value != getattr(after, group).model_dump()[key]:
                 changed.add(f"{group}.{key}")
-    for key in ["masks", "semantic_masks", "segmentation", "local_adjustments", "crop"]:
+    for key in ["masks", "semantic_masks", "segmentation", "local_adjustments", "crop", "approved_crop", "spot_healing", "natural_skin"]:
         if getattr(before, key) != getattr(after, key):
             changed.add(key)
     return changed
@@ -73,6 +75,14 @@ def validate_complete_plan(workflow, photo, plan):
         if data.get("recommendation") == "revise" and data.get("corrections"):
             review = AIReview.model_validate_json((folder / "ai_review.json").read_bytes())
             allowed = {p for item in review.corrections for p in item.adjustment_paths}
+            if plan.recipe.spot_healing:
+                # The user's separate explicit consent can authorize this one operation;
+                # it cannot authorize unrelated artistic changes.
+                workflow.healing_provider(photo, plan.recipe)
+                allowed.add('spot_healing')
+            if plan.recipe.approved_crop:
+                workflow.validate_crop(photo,plan.recipe)
+                allowed.update({'crop','approved_crop'})
             changes = changed_adjustments(previous, plan.recipe)
             if not changes or not changes <= allowed:
                 raise FlowError(f"Correction must address only recommended adjustments: {sorted(allowed)}; changed {sorted(changes)}")
@@ -86,6 +96,11 @@ def review_context(workflow, photo):
     if recipe.semantic_masks:
         required.add(f"{photo.current_version}/segmentation.json")
         required.update(f"{photo.current_version}/masks/{r.id}-overlay.jpg" for r in recipe.semantic_masks)
+    if recipe.spot_healing:
+        required.update(f"{photo.current_version}/healing/{name}" for name in
+                        ['before.jpg','after.jpg','before_after.jpg','operation.json','proposal.json','decision.json'])
+    if recipe.approved_crop:
+        required.update(f'{photo.current_version}/cropping/{name}' for name in ['proposal.json','decision.json'])
     return {"required_artifacts": {p: digest(workflow.session.work(photo.id, p)) for p in sorted(required)},
             "available_versions": [{"version": v, "after": str(workflow.session.work(photo.id, v, "after.jpg")),
                 "after_sha256": digest(workflow.session.work(photo.id, v, "after.jpg"))} for v in photo.versions],
@@ -241,6 +256,12 @@ class Director:
                     self.workflow.prepare(photo.id)
                 else:
                     return self.stop(photo, "Original analysis inputs unavailable")
+            framing = None
+            if self.run.config.smart_crop:
+                from .cropping import checkpoint
+                framing = checkpoint(self.workflow,photo)
+                if framing['action'] != 'crop_selected':
+                    return framing
             return {"action": "targeted_correction_plan" if photo.active_attempt_count else "analyze_and_plan",
                     "photo_id": photo.id, "style": self.run.config.style,
                     "context": json.loads(context.read_text()), "analysis_categories": sorted(ANALYSIS_CATEGORIES),
@@ -248,15 +269,43 @@ class Director:
                     "parent_version": self.workflow.revision_parent(photo),
                     "feedback": self.workflow.request_revision(photo.id) if photo.state == "revision_requested" else None,
                     "semantic_segmentation": semantics,
+                    'approved_framing':framing,
                     "instruction": "Codex inspects actual RAW preview, independently creates a complete validated plan; use explore before committing to a full pass."}
         if photo.state == "ready":
             self.workflow.process(photo.id)
         if photo.state != "review":
             return self.stop(photo, f"Unexpected workflow checkpoint: {photo.state}")
+        from . import healing
+        _, current_recipe, _ = self.workflow.validate_version(photo, photo.current_version)
+        if not current_recipe.spot_healing:
+            if photo.id not in self.run.spot_checks:
+                self.run.spot_checks[photo.id] = healing.scan(self.workflow, photo.id)
+                self.save()
+            check = healing.current_check(self.workflow,photo,self.run.spot_checks[photo.id])
+            if check['status'] == 'needs_visual_review':
+                return {'action':'spot_healing_visual_review',**check,
+                    'instruction':'Inspect the ACTUAL native face crop and annotated candidates before proposing any healing. Reject uncertain marks and sensitive zones using spot-review; zero candidates is acceptable. Never invent visual review or consent.'}
+            if check['status'] == 'suspected':
+                folder, proposal = healing.load_proposal(self.workflow, photo, check['request_id'])
+                decision_path = folder / 'decision.json'
+                if not decision_path.exists():
+                    return {'action': 'spot_healing_decision', **check,
+                        'remaining_full_passes': photo.active_pass_limit-photo.active_attempt_count,
+                        'instruction': 'ALWAYS show the real suspected-spot overlay in Codex chat and notify the user. Ask: '+healing.QUESTION+
+                        '. Wait for an explicit Yes/No for this photo; silence or generic resolution is not consent. Yes does not approve the photograph/export.'}
+                decision = read_model(decision_path, healing.Decision)
+                if (decision.photo_id != photo.id or decision.request_id != proposal.id
+                        or decision.proposal_sha256 != digest(folder/'proposal.json')
+                        or decision.shown_overlay_sha256 != proposal.overlay_sha256):
+                    raise FlowError('Healing decision provenance mismatch')
+                if decision.answer == 'Yes':
+                    healing.apply_approved(self.workflow, photo.id, proposal.id)
+        # No (or no candidates) continues the ordinary review without healing.
         review_file = self.session.work(photo.id, photo.current_version, "ai_review.json")
         data = json.loads(review_file.read_text())
         if data.get("status") or not data.get("assessment"):
-            return {"action": "visual_review", "photo_id": photo.id, **review_context(self.workflow, photo)}
+            return {"action": "visual_review", "photo_id": photo.id,
+                    'spot_check': self.run.spot_checks.get(photo.id), **review_context(self.workflow, photo)}
         review = read_model(review_file, AIReview)
         validate_directed_review(self.workflow, photo, review)
         if photo.selected_version != review.best_version or photo.selection_rationale != review.selection_rationale:
@@ -273,6 +322,18 @@ class Director:
             reporting.text(request, "# AI visual correction plan\n\n" + review.model_dump_json(indent=2))
             self.workflow.request_revision(photo.id, feedback_file=request)
             return self.advance()
+        if self.run.config.smart_crop:
+            from .cropping import checkpoint
+            framing=checkpoint(self.workflow,photo)
+            if framing['action']!='crop_selected':
+                return framing
+            if framing['approved_crop'] and not current_recipe.approved_crop:
+                if photo.active_attempt_count>=photo.active_pass_limit:
+                    return self.stop(photo,'Crop approved, but no remaining full-resolution pass. A new cycle requires explicit user authorization.')
+                request=self.session.path('director','requests',f'{self.run.id}-crop.md')
+                reporting.text(request,'Explicit user crop selection. Keep the grade and apply only the approved framing.\n'+json.dumps(framing,ensure_ascii=False))
+                self.workflow.request_revision(photo.id,feedback_file=request)
+                return self.advance()
         if not self.run.pending_bundle:
             from .chat_reporting import create_chat_report
             bundle = create_chat_report(self.workflow, photo)
@@ -289,7 +350,9 @@ class Director:
         photo = self.workflow.photo(identifier)
         if photo.state not in {"analyzing", "revision_requested", "ready"}:
             raise FlowError("Explore before a full render, not after a final review")
-        plan = read_model(Path(plan_path), Plan)
+        plan = self.workflow.plan_defaults(read_model(Path(plan_path), Plan))
+        if plan.recipe.spot_healing:
+            raise FlowError('Spot Healing uses native pixels and an explicitly authorized full pass, not reduced exploration')
         validate_complete_plan(self.workflow, photo, plan)
         self.session.source(photo)
         context = json.loads(self.session.work(photo.id, "context.json").read_text())
@@ -321,7 +384,7 @@ class Director:
         scale = small.shape[1] / developed.pixels.shape[1]
         result = imaging.process_pixels(small, plan.recipe, spatial_scale=scale,
                                        semantic_provider=self.workflow.semantic_cache(photo,plan.recipe))
-        imaging.save_previews(imaging.crop_image(neutral, plan.recipe.crop), result, folder)
+        imaging.save_previews(imaging.crop_image(neutral, plan.recipe.crop,plan.recipe.approved_crop,preview=True), result, folder)
         write_json(folder / "plan.json", plan)
         record = {"resolution": "preview_only", "full_passes_used": photo.active_attempt_count,
             "lifetime_attempts": len(photo.render_attempts),

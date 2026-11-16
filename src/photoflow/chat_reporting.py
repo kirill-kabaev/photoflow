@@ -65,6 +65,8 @@ def create_chat_report(workflow, photo):
     relatives = ["before.jpg", "after.jpg", "before_after.jpg"]
     relatives += [f"details/{r.id}/before_after.jpg" for r in recipe.detail_regions]
     relatives += [f"masks/{r.id}-overlay.jpg" for r in recipe.semantic_masks]
+    if recipe.spot_healing:
+        relatives += [f'healing/{name}' for name in ['before.jpg','after.jpg','before_after.jpg']]
     directory = workflow.session.work(photo.id, "chat_reports", uuid.uuid4().hex)
     directory.mkdir(parents=True)
     report = ChatReport(photo_id=photo.id, filename=photo.filename, session=workflow.session.root.name,
@@ -108,6 +110,8 @@ def create_chat_report(workflow, photo):
 {reporting.bullets(report.limitations)}
 
 [Постоянный отчёт версии]({link('report.md')}). Экспорт не выполнялся.
+
+{('![Spot Healing: лицо 100%, до/после]('+link('healing/before_after.jpg')+')') if recipe.spot_healing else ''}
 
 Для разговора использовать tool ImageContent, если он доступен, или прямые ссылки.
 Встроенный Markdown-preview файла и inline-рендер разговора — разные возможности;

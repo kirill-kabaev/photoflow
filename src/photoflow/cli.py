@@ -53,6 +53,7 @@ def parser():
     direct.add_argument("--style", default="Natural Commercial Portrait")
     direct.add_argument("--mode", choices=["codex", "api"], default="codex")
     direct.add_argument("--semantic", action="store_true", help="Run/reuse installed local semantic parsing before artistic analysis")
+    direct.add_argument('--smart-crop',action='store_true',help='AI visual composition and explicit user crop choice before rendering')
     direct.add_argument("--resolution", help="Record an explicit user decision to resume after an exception; never resets pass limits")
     explore = sub.add_parser("explore", help="Render a bounded reduced-resolution candidate from cached linear RAW")
     explore.add_argument("session")
@@ -75,6 +76,35 @@ def parser():
     cycle.add_argument("--by",required=True)
     cycle.add_argument("--reason",required=True)
     cycle.add_argument("--max-passes",type=int,choices=[1,2],default=2)
+    for name in ['spot-scan', 'spot-decision', 'spot-review', 'skin-preview']:
+        spot = sub.add_parser(name, help='Local suspected spots; healing requires a separate explicit per-photo Yes')
+        spot.add_argument('session')
+        spot.add_argument('photo')
+        if name in {'spot-scan','skin-preview'}:
+            spot.add_argument('--version')
+        elif name == 'spot-review':
+            spot.add_argument('--request',required=True)
+            spot.add_argument('--keep',nargs='*',default=[])
+            spot.add_argument('--reason',required=True)
+            spot.add_argument('--inspected-sha256',required=True)
+        else:
+            spot.add_argument('--request', required=True)
+            spot.add_argument('--answer', choices=['Yes', 'No'], required=True)
+            spot.add_argument('--by', required=True)
+            spot.add_argument('--message', required=True, help='Exact user response; never invent consent')
+            spot.add_argument('--shown-sha256', required=True, help='Checksum of overlay actually shown in chat')
+    for name in ['crop-propose','crop-decision']:
+        crop=sub.add_parser(name)
+        crop.add_argument('session')
+        crop.add_argument('photo')
+        if name=='crop-propose':
+            crop.add_argument('--file',type=Path,required=True)
+        else:
+            crop.add_argument('--request',required=True)
+            crop.add_argument('--choice',choices=['16:9','9:16','keep original'],required=True)
+            crop.add_argument('--by',required=True)
+            crop.add_argument('--message',required=True)
+            crop.add_argument('--shown-sha256',required=True)
     return root
 
 
@@ -88,6 +118,26 @@ def execute(args):
             reporting.session_report(session, queue)
             return queue.model_dump(mode="json")
         workflow = Workflow(session)
+        if args.command in {'crop-propose','crop-decision'}:
+            from . import cropping
+            from .storage import read_model
+            if args.command=='crop-propose':
+                analysis=read_model(args.file,cropping.CropAnalysis)
+                if workflow.photo(args.photo).id!=analysis.photo_id:
+                    raise FlowError('Crop analysis belongs to another photo')
+                return cropping.propose(workflow,analysis)
+            return cropping.decide(workflow,args.photo,args.request,args.choice,args.by,args.message,args.shown_sha256)
+        if args.command in {'spot-scan', 'spot-decision', 'spot-review', 'skin-preview'}:
+            from . import healing
+            if args.command == 'skin-preview':
+                from .skin import preview_existing
+                return preview_existing(workflow,args.photo,args.version)
+            if args.command == 'spot-review':
+                return healing.review_candidates(workflow,args.photo,args.request,args.keep,args.reason,args.inspected_sha256)
+            if args.command == 'spot-scan':
+                return healing.scan(workflow, args.photo, args.version)
+            return healing.decide(workflow, args.photo, args.request, args.answer, args.by,
+                                  args.message, args.shown_sha256)
         if args.command == "segment":
             from .segmentation import segment
             return segment(workflow,args.photo,device=args.device)
@@ -103,12 +153,15 @@ def execute(args):
             if args.mode == "api":
                 raise FlowError("API agent is not implemented/configured; use Codex-assisted mode. No image upload occurred")
             if args.resume:
+                if args.smart_crop and director.run:
+                    director.run.config.smart_crop=True
+                    director.save()
                 return director.resolve(args.resolution) if args.resolution else director.advance()
             if args.resolution:
                 raise FlowError("Use --resolution only with --resume after the user's decision")
             return director.start(args.instruction, args.photo, DirectorConfig(
                 max_full_passes=args.max_passes, max_previews=args.max_previews, style=args.style,
-                semantic=args.semantic), next_only=args.next)
+                semantic=args.semantic,smart_crop=args.smart_crop), next_only=args.next)
         if args.command == "chat-report":
             from .chat_reporting import create_chat_report
             return create_chat_report(workflow, workflow.photo(args.photo))
