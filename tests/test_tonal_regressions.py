@@ -90,3 +90,16 @@ def test_detail_outside_crop_or_empty_at_pixel_scale_rejected(tmp_path):
     pixels = np.zeros((10, 10, 3), dtype=np.float32)
     with pytest.raises(FlowError, match="detail crop"):
         imaging.save_details(pixels, pixels, pixels.shape, recipe, tmp_path)
+
+
+@pytest.mark.parametrize('denoise,sharpen', [(0.0,0.0),(0.2,0.0),(0.0,0.2),(0.2,0.2)])
+def test_tiled_global_processing_matches_whole_image_across_boundaries(denoise,sharpen):
+    from photoflow.models import GlobalAdjustments
+    rng=np.random.default_rng(7201)
+    source=rng.uniform(0.01,0.8,(790,47,3)).astype(np.float32)
+    adjustment=GlobalAdjustments(exposure_ev=0.2,highlights=0.4,shadows=0.15,
+                                contrast=0.08,saturation=1.02,denoise=denoise,sharpen=sharpen)
+    whole=imaging._global_pixels(source,adjustment)
+    tiled=imaging.process_pixels(source,make_recipe(global_adjustments=adjustment))
+    assert np.array_equal(whole,tiled)
+    assert np.array_equal(whole[250:265],tiled[250:265])

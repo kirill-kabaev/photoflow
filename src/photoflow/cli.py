@@ -40,6 +40,30 @@ def parser():
             command.add_argument("--reason", required=True)
     schema = sub.add_parser("schema")
     schema.add_argument("kind", choices=["plan", "recipe", "review"])
+    direct = sub.add_parser("direct", help="Start/resume the bounded Codex-assisted workflow")
+    direct.add_argument("session")
+    target = direct.add_mutually_exclusive_group(required=True)
+    target.add_argument("--photo")
+    target.add_argument("--batch", action="store_true")
+    target.add_argument("--next", action="store_true", help="Scope this run to one actionable photo, including failures")
+    target.add_argument("--resume", action="store_true")
+    direct.add_argument("--instruction", default="Process professionally in Natural Commercial Portrait style; leave unapproved")
+    direct.add_argument("--max-passes", type=int, choices=[1, 2], default=2)
+    direct.add_argument("--max-previews", type=int, choices=range(1, 7), default=3)
+    direct.add_argument("--style", default="Natural Commercial Portrait")
+    direct.add_argument("--mode", choices=["codex", "api"], default="codex")
+    direct.add_argument("--resolution", help="Record an explicit user decision to resume after an exception; never resets pass limits")
+    explore = sub.add_parser("explore", help="Render a bounded reduced-resolution candidate from cached linear RAW")
+    explore.add_argument("session")
+    explore.add_argument("photo")
+    explore.add_argument("--file", type=Path, required=True)
+    explore.add_argument("--name", required=True)
+    chat = sub.add_parser("chat-report")
+    chat.add_argument("session")
+    chat.add_argument("photo")
+    presented = sub.add_parser("presented", help="Acknowledge actual artifact presentation, never approval")
+    presented.add_argument("session")
+    presented.add_argument("--method", choices=["tool_image_content", "artifact_links"], required=True)
     return root
 
 
@@ -53,6 +77,24 @@ def execute(args):
             reporting.session_report(session, queue)
             return queue.model_dump(mode="json")
         workflow = Workflow(session)
+        if args.command in {"direct", "explore", "presented"}:
+            from .director import Director, DirectorConfig
+            director = Director(workflow)
+            if args.command == "explore":
+                return director.explore(args.photo, args.file, args.name)
+            if args.command == "presented":
+                return director.presented(args.method)
+            if args.mode == "api":
+                raise FlowError("API agent is not implemented/configured; use Codex-assisted mode. No image upload occurred")
+            if args.resume:
+                return director.resolve(args.resolution) if args.resolution else director.advance()
+            if args.resolution:
+                raise FlowError("Use --resolution only with --resume after the user's decision")
+            return director.start(args.instruction, args.photo, DirectorConfig(
+                max_full_passes=args.max_passes, max_previews=args.max_previews, style=args.style), next_only=args.next)
+        if args.command == "chat-report":
+            from .chat_reporting import create_chat_report
+            return create_chat_report(workflow, workflow.photo(args.photo))
         if args.command in {"status", "queue"}:
             if args.command == "queue":
                 return workflow.queue.model_dump(mode="json")

@@ -66,3 +66,35 @@ analyzing до декодирования, но не объявляет AI-ан�
 тот же набор версий библиотек. Намеренное редактирование истории/манифеста не
 аутентифицируется криптографической подписью; это локальная рабочая папка пользователя.
 Полная идентичность чисел на разных процессорах и версиях библиотек не обещается.
+
+## Оптимизированный Director
+
+Расширение сохраняет существующие CLI/Workflow/Queue и добавляет три используемых модуля:
+
+| Модуль | Ответственность |
+|---|---|
+| `cache.py` | Атомарный validated RAW cache, source/pixels checksum, read-only mmap |
+| `director.py` | Durable Mode A actions, scope/preview budgets, completeness, corrections, stopping и continuation |
+| `chat_reporting.py` | Проверяемый bundle реальных выбранных изображений и постоянный Markdown |
+
+Photo хранит render_attempts, max_full_passes, selected_version, selection_rationale,
+directed и target_style. Старые поля approval/current_version сохраняют своё значение.
+AI selection не является approval. Все изменения по-прежнему под session-wide flock.
+
+DirectorRun фиксирует scope, active/completed, preview_ids, pending presentation,
+configuration, deliveries и intervention/resolution events. Queue остаётся
+авторитетной для попыток и фото; current.json — для состояния orchestration.
+Crash после публикации версии или review до обновления queue восстанавливается
+по проверенному manifest/AIReview, без повторного полного прохода.
+
+Резервирование RenderAttempt в queue атомарно предшествует обработке. После crash
+слот остаётся использованным. Новые ветви/run не сбрасывают лимит. `max_full_passes`
+можно уменьшить до одного, но не расширить сверх двух через обычный CLI.
+Исторические версии до введения счётчика не теряются и не считаются задним числом.
+
+Показ отчёта — отдельный action и acknowledgement. Presented не декодирует следующий
+кадр; после него Codex решает продолжить через direct --resume в рамках заданного scope.
+Ошибки, значимые остаточные дефекты и художественная неоднозначность останавливают
+цикл; обычный review результат не требует approval для продолжения batch.
+Python не делает vision API вызовов и не запускает новый разговор. Mode A требует
+живого Codex-агента; для unattended Mode B нужны отдельная реализация и opt-in.

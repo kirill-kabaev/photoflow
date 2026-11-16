@@ -3,13 +3,16 @@ import json
 import os
 import re
 import uuid
+import hashlib
+from time import perf_counter
 from pathlib import Path
 
 from . import __version__
 from . import imaging, queue as queues, reporting
+from .cache import RawCache
 from .models import (AIReview, DetailRegion, ExportManifest, Plan, RawSettings, Recipe, Region,
-                     RevisionRequest, SessionStyle, VersionManifest)
-from .storage import (FlowError, atomic_write, checked_version, digest, now,
+                     RenderAttempt, RevisionRequest, SessionStyle, VersionManifest)
+from .storage import (FlowError, atomic_write, checked_version, digest, json_bytes, now,
                       read_model, sync_dir, write_json)
 
 
@@ -20,6 +23,9 @@ class Workflow:
         self.decoder = decoder
         self.queue = queues.load(session)
 
+    def decoded(self, photo, settings, cache=None):
+        return (cache or RawCache(self.session, self.decoder)).get(photo, settings)
+
     def photo(self, identifier):
         return queues.find(self.queue, identifier)
 
@@ -28,6 +34,9 @@ class Workflow:
         reporting.session_report(self.session, self.queue)
 
     def fail(self, photo, exc):
+        for attempt in photo.render_attempts:
+            if attempt.status == "reserved":
+                attempt.status, attempt.reason = "failed", str(exc)
         if photo.state != "failed":
             queues.transition(photo, "failed", str(exc))
         photo.error = str(exc)
@@ -44,7 +53,7 @@ class Workflow:
         self.save()
         try:
             source = self.session.source(photo)
-            decoded = self.decoder(source, RawSettings())
+            decoded = self.decoded(photo, RawSettings())
             folder = self.session.work(photo.id)
             folder.mkdir(parents=True, exist_ok=True)
             preview = folder / "analysis_preview.jpg"
@@ -68,6 +77,9 @@ class Workflow:
         if photo.state not in {"analyzing", "revision_requested"}:
             raise FlowError("Plan import requires analyzing or revision_requested state")
         plan = read_model(Path(path), Plan)
+        if photo.directed:
+            from .director import validate_complete_plan
+            validate_complete_plan(self, photo, plan)
         self.session.source(photo)
         context = json.loads(self.session.work(photo.id, "context.json").read_text())
         if plan.recipe.photo_id != photo.id or plan.recipe.source_sha256 != photo.source_sha256:
@@ -142,8 +154,13 @@ class Workflow:
         photo = self.photo(identifier)
         if photo.state != "ready":
             raise FlowError("Processing requires a validated imported plan (state ready)")
+        if len(photo.render_attempts) >= photo.max_full_passes:
+            raise FlowError("Full-resolution pass limit reached; stop and present the best available version")
         original_photo = photo.model_copy(deep=True)
         plan = read_model(self.session.work(photo.id, "plan.json"), Plan)
+        if photo.directed:
+            from .director import validate_complete_plan
+            validate_complete_plan(self, photo, plan)
         recipe = plan.recipe
         if recipe.parent_version != self.revision_parent(photo):
             raise FlowError("Stale plan parent version")
@@ -159,16 +176,20 @@ class Workflow:
             raise FlowError("Version collision")
         temporary.mkdir()
         photo.operation_version = version
+        photo.render_attempts.append(RenderAttempt(version=version,
+            recipe_sha256=hashlib.sha256(json_bytes(recipe)).hexdigest(), started_at=now()))
         queues.transition(photo, "processing", f"Reserved {version}")
         self.save()
         try:
+            started = perf_counter()
+            cache = RawCache(self.session, self.decoder)
             source = self.session.source(photo)
-            baseline = self.decoder(source, RawSettings())
+            baseline = self.decoded(photo, RawSettings(), cache)
             # Reuse baseline only if RAW settings are exactly the neutral baseline.
             if recipe.raw == RawSettings():
                 decoded = baseline
             else:
-                decoded = self.decoder(source, recipe.raw)
+                decoded = self.decoded(photo, recipe.raw, cache)
             write_json(temporary / "recipe.json", recipe)
             write_json(temporary / "analysis.json", plan.analysis)
             write_json(temporary / "decoder.json", decoded.metadata)
@@ -179,6 +200,9 @@ class Workflow:
             measures = {"before": imaging.metrics(before), "after": imaging.metrics(result)}
             measures.update(imaging.save_previews(before, result, temporary))
             measures["details"] = imaging.save_details(before, result, baseline.pixels.shape, recipe, temporary)
+            measures["performance"] = {"elapsed_before_publish_seconds": perf_counter() - started,
+                                       "raw_cache": cache.events, "full_pass": len(photo.render_attempts),
+                                       "max_full_passes": photo.max_full_passes}
             write_json(temporary / "metrics.json", measures)
             reporting.text(temporary / "feedback.md", f"# Обратная связь — {photo.filename} {version}\n\nStatus: review\n\n## Запрошенные изменения\n\n")
             write_json(temporary / "ai_review.json", {"status": "awaiting_codex_visual_review"})
@@ -209,6 +233,7 @@ class Workflow:
             sync_dir(destination.parent)
             photo.operation_version = None
             photo.revision_request = None
+            photo.render_attempts[-1].status = "complete"
             self.save()
             return {"photo_id": photo.id, "version": version, "state": photo.state,
                     "report": str(destination / "report.md"), "ai_review": "pending"}
@@ -227,7 +252,7 @@ class Workflow:
             raise FlowError("No version to revise")
         base = from_version or self.revision_parent(photo)
         self.validate_version(photo, base)
-        if photo.state not in {"review", "approved", "exported", "failed", "revision_requested"}:
+        if photo.state not in {"review", "approved", "exported", "failed", "revision_requested", "ready"}:
             raise FlowError("Cannot request revision from current state")
         if from_version or feedback_file or photo.revision_request is None:
             feedback_relative = f"{base}/feedback.md"
@@ -261,6 +286,15 @@ class Workflow:
             assessment = read_model(Path(path), AIReview)
             if (assessment.photo_id, assessment.version, assessment.comparison_sha256) != (photo.id, photo.current_version, digest(comparison)):
                 raise FlowError("Review references a different image or version")
+            if photo.directed:
+                from .director import validate_directed_review
+                validate_directed_review(self, photo, assessment)
+            if assessment.best_version is not None:
+                self.validate_version(photo, assessment.best_version)
+                if not assessment.selection_rationale.strip():
+                    raise FlowError("Best-version selection requires a rationale")
+                photo.selected_version = assessment.best_version
+                photo.selection_rationale = assessment.selection_rationale
             write_json(folder / "ai_review.json", assessment)
             photo.history.append({"at": now(), "event": "visual_review", "provider": assessment.provider,
                                   "model": assessment.model, "recommendation": assessment.recommendation})
@@ -316,7 +350,7 @@ class Workflow:
         linked = []
         try:
             source = self.session.source(photo)
-            decoded = self.decoder(source, recipe.raw)
+            decoded = self.decoded(photo, recipe.raw)
             result = imaging.process_pixels(decoded.pixels, recipe)
             validation = imaging.export_pixels(result, staging / names[0], staging / names[1], recipe.output.jpeg_quality)
             self.session.source(photo)
@@ -365,6 +399,9 @@ class Workflow:
                         photo.versions = candidate.versions
                         photo.current_version = version
                         photo.revision_request = None
+                        for attempt in photo.render_attempts:
+                            if attempt.version == version:
+                                attempt.status = "complete"
                         photo.approved_version = photo.approved_recipe_sha256 = photo.approved_by = photo.approved_at = None
                         queues.transition(photo, "review", "Recovered complete immutable version after interrupted queue update")
                         reporting.version_report(self.session, photo, version)

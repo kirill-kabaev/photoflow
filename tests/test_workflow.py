@@ -294,6 +294,11 @@ def test_candidates_branch_from_same_parent_without_mutating_its_files(workflow)
         assert external.read_text() == Path(request["feedback_file"]).read_text()
         path = make_plan(workflow, photo, parent="v001", exposure=exposure, feedback=Path(request["feedback_file"]))
         workflow.import_plan(photo.id, path)
+        if expected_version == "v003":
+            with pytest.raises(FlowError, match="pass limit"):
+                workflow.process(photo.id)
+            assert not workflow.session.work(photo.id, "v003").exists()
+            break
         assert workflow.process(photo.id)["version"] == expected_version
         folder = workflow.session.work(photo.id, expected_version)
         assert json.loads((folder / "manifest.json").read_text())["parent_version"] == "v001"

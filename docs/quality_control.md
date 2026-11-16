@@ -61,3 +61,24 @@ AI-балл за доказательство качества. Highlight/shadow
 тональных операторов, отсутствие двойной gamma, независимый LibRaw sRGB reference,
 ветви от одной версии без изменения её файлов и native-кропы с учётом итогового crop.
 Реальные результаты и ограничения: [portrait_rendering_diagnosis.md](./portrait_rendering_diagnosis.md).
+
+## Оптимизированный цикл и визуальная доставка
+
+`tests/test_director.py` проверяет полную цепочку с явно synthetic AI fixtures:
+полноту начального плана, повторную валидацию перед выполнением, два/один full pass,
+адресность коррекции, выбор более ранней версии, stopping/intervention, восстановление
+публикации/review, защищённый chat bundle, source/cache integrity и batch/next scope.
+Preview и full renderer сравниваются по цветовым semantics; счётчик декодирований
+доказывает одно декодирование на RawSettings для analysis/explore/full.
+`tests/test_tonal_regressions.py` дополнительно проверяет точное совпадение tiled и
+whole-array глобальных операций на случайных данных и границах блоков, включая фильтры.
+
+Реальный workflow DSC03037 не подменяется fixtures: новый RAW-derived результат
+осмотрен Codex вместе с native-кропами, выбрана v006, actual comparison передан как
+ImageContent, показ зафиксирован как acknowledgement агента. Пользователь затем явно
+подтвердил: «Да, изображения видны в разговоре». Это проверка отображения именно
+в текущем клиенте; результат записан отдельно в presentation_evidence.json.
+Экран клиента Python недоступен: созданный до ответа bundle сохраняет
+frontend_rendering_verified=false. Markdown-файл сам по себе не доказывает
+inline-рендер разговора. Кэш, ledger, исторические версии и RAW проверяются отдельным audit.
+Доказательства и ограничения: [итоговый отчёт](./implemented_autonomous_processing.md).

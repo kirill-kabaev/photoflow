@@ -158,6 +158,7 @@ class Analysis(StrictModel):
     recommendations: Annotated[list[Text], Field(min_length=1)]
     uncertainties: Annotated[list[Text], Field(min_length=1)]
     human_attention: list[Text] = []
+    coverage: dict[str, Text] = {}
 
 
 class Plan(StrictModel):
@@ -169,6 +170,16 @@ class Plan(StrictModel):
         if (self.analysis.photo_id, self.analysis.source_sha256) != (self.recipe.photo_id, self.recipe.source_sha256):
             raise ValueError("analysis and recipe must reference the same photo and source")
         return self
+
+
+class CorrectionRecommendation(StrictModel):
+    problem: Text
+    region: Text
+    proposed_correction: Text
+    expected_improvement: Text
+    side_effects: list[Text]
+    verification: Text
+    adjustment_paths: Annotated[list[Annotated[str, Field(pattern=r"^(?:global_adjustments\.(?:exposure_ev|highlights|shadows|black_point|white_point|contrast|saturation|vibrance|channel_gains|tone_curve|sharpen|denoise)|raw\.(?:white_balance|multipliers|highlight_mode)|masks|local_adjustments|crop)$")]], Field(min_length=1)]
 
 
 class AIReview(StrictModel):
@@ -183,6 +194,21 @@ class AIReview(StrictModel):
     concerns: list[Text]
     recommendation: Literal["human_review", "revise", "manual_attention"]
     rationale: Text
+    assessment: dict[str, Text] = {}
+    inspected_artifacts: dict[str, Checksum] = {}
+    full_resolution_texture_inspected: bool = False
+    corrections: list[CorrectionRecommendation] = []
+    best_version: Version | None = None
+    selection_rationale: str = ""
+    intervention: Literal["none", "artistic_ambiguity", "identity_risk", "missing_capability", "unresolved_defect"] = "none"
+
+
+class RenderAttempt(StrictModel):
+    version: Version
+    recipe_sha256: Checksum
+    started_at: str
+    status: Literal["reserved", "complete", "failed"] = "reserved"
+    reason: str | None = None
 
 
 class RevisionRequest(StrictModel):
@@ -205,6 +231,12 @@ class Photo(StrictModel):
     approved_at: str | None = None
     operation_version: Version | None = None
     revision_request: RevisionRequest | None = None
+    max_full_passes: Literal[1, 2] = 2
+    render_attempts: list[RenderAttempt] = []
+    selected_version: Version | None = None
+    selection_rationale: str = ""
+    directed: bool = False
+    target_style: str | None = None
     priority: int = 0
     error: str | None = None
     updated_at: str
@@ -216,6 +248,12 @@ class Photo(StrictModel):
             raise ValueError("duplicate versions")
         if self.current_version and self.current_version not in self.versions:
             raise ValueError("current version is not registered")
+        if self.selected_version and self.selected_version not in self.versions:
+            raise ValueError("selected version is not registered")
+        if len(self.render_attempts) > self.max_full_passes:
+            raise ValueError("full-resolution pass limit exceeded")
+        if len({a.version for a in self.render_attempts}) != len(self.render_attempts):
+            raise ValueError("duplicate render attempts")
         if self.approved_version and self.approved_version not in self.versions:
             raise ValueError("approved version is not registered")
         if self.revision_request and self.revision_request.parent_version not in self.versions:

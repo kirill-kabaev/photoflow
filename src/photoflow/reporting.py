@@ -162,11 +162,13 @@ def session_report(session, queue):
     counts = dict(sorted(Counter(p.state for p in queue.photos).items()))
     rows = []
     for photo in queue.photos:
-        version = photo.current_version
+        version = photo.selected_version or photo.current_version
         link = f"work/{photo.id}/{version}" if version else None
         filename = photo.filename.replace("|", "\\|").replace("\n", " ")
         previews = f"![До]({link}/before.jpg) ![После]({link}/after.jpg)" if link else "—"
         details = f"[{version}]({link}/report.md) · [feedback]({link}/feedback.md)" if link else "—"
+        if photo.selected_version:
+            details += f" · AI выбрал {photo.selected_version}; последняя {photo.current_version}"
         note = photo.error or (f"Дубликат {photo.duplicate_of}; next не выбирает, прямой analyze допустим" if photo.duplicate_of else "—")
         errors = note.replace("|", "\\|").replace("\n", " ")
         rows.append(f"| {filename} (`{photo.id}`) | {photo.state} | {photo.priority} | {details} | {photo.approved_version or '—'} | {errors} | {previews} |")

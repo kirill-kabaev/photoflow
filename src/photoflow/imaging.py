@@ -111,9 +111,9 @@ def _blur(image, sigma=1.0):
     return gaussian_filter(image, sigma=(sigma, sigma, 0), mode="reflect")
 
 
-def _smooth(image, amount):
+def _smooth(image, amount, sigma=1.0):
     # Edge-weighted low-amplitude denoise, not a semantic skin model.
-    base = _blur(image)
+    base = _blur(image, sigma)
     difference = np.mean((image - base) ** 2, axis=2, keepdims=True)
     edge_weight = np.exp(-difference / 0.0004)
     return image + amount * edge_weight * (base - image)
@@ -128,10 +128,7 @@ def crop_image(image, crop):
     return image[y1:y2, x1:x2].copy()
 
 
-def process_pixels(source, recipe: Recipe, mask_dir=None, preview_size=1400):
-    if source.dtype != np.float32 or source.ndim != 3 or source.shape[2] != 3 or not np.isfinite(source).all():
-        raise FlowError("Engine expects finite float32 RGB pixels")
-    a = recipe.global_adjustments
+def _global_pixels(source, a, spatial_scale=1.0):
     image = source.copy()
     image *= np.float32(2**a.exposure_ev)
     image *= np.asarray(a.channel_gains, dtype=np.float32)
@@ -154,18 +151,35 @@ def process_pixels(source, recipe: Recipe, mask_dir=None, preview_size=1400):
     multiplier = a.saturation + a.vibrance * (1 - approx_saturation)
     display = gray + chroma * multiplier[..., None]
     if a.denoise:
-        display = _smooth(display, a.denoise)
+        display = _smooth(display, a.denoise, spatial_scale)
     if a.sharpen:
-        display += a.sharpen * np.clip(display - _blur(display), -0.08, 0.08)
+        display += a.sharpen * np.clip(display - _blur(display, spatial_scale), -0.08, 0.08)
     image = linearize_srgb(np.clip(display, 0, 1))
-    del display
+    return image
+
+
+def process_pixels(source, recipe: Recipe, mask_dir=None, preview_size=1400, spatial_scale=1.0):
+    if not 0 < spatial_scale <= 1:
+        raise FlowError("Spatial preview scale must be in (0, 1]")
+    if source.dtype != np.float32 or source.ndim != 3 or source.shape[2] != 3 or not np.isfinite(source).all():
+        raise FlowError("Engine expects finite float32 RGB pixels")
+    image = np.empty_like(source, subok=False)
+    # All global operators are pointwise except sigma-scaled Gaussian filters.
+    # Two sequential filters require at most twice their four-sigma radius.
+    halo = 2 * int(np.ceil(4 * spatial_scale))
+    for first in range(0, source.shape[0], 256):
+        last = min(first + 256, source.shape[0])
+        top, bottom = max(0, first - halo), min(source.shape[0], last + halo)
+        tile = _global_pixels(source[top:bottom], recipe.global_adjustments, spatial_scale)
+        image[first:last] = tile[first - top:last - top]
+        del tile
+    preview = to_preview(source, preview_size) if mask_dir is not None and recipe.masks else None
     # Generate one full-resolution mask at a time to bound peak memory.
     for region in recipe.masks:
         mask = ellipse_mask(image.shape, region)
         if mask_dir is not None:
             mask_dir.mkdir(parents=True, exist_ok=True)
             np.save(mask_dir / f"{region.id}.npy", mask, allow_pickle=False)
-            preview = to_preview(source, preview_size)
             small = Image.fromarray(np.uint8(np.rint(mask * 255))).resize(preview.size, Image.Resampling.BILINEAR)
             overlay = Image.new("RGB", preview.size, (255, 60, 0))
             alpha = small.point(lambda value: int(value * 0.4))
@@ -183,9 +197,9 @@ def process_pixels(source, recipe: Recipe, mask_dir=None, preview_size=1400):
                 gray = luminance(image)[..., None]
                 image += (image - gray) * (amount * mask)[..., None]
             elif operation.operation == "sharpen":
-                image += amount * mask[..., None] * np.clip(image - _blur(image), -0.04, 0.04)
+                image += amount * mask[..., None] * np.clip(image - _blur(image, spatial_scale), -0.04, 0.04)
             elif operation.operation == "smooth":
-                image += mask[..., None] * (_smooth(image, amount) - image)
+                image += mask[..., None] * (_smooth(image, amount, spatial_scale) - image)
         del mask
     if not np.isfinite(image).all():
         raise FlowError("Processing produced nonfinite pixels")

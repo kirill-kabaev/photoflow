@@ -10,7 +10,7 @@ RAW_EXTENSIONS = {".arw", ".nef", ".cr2", ".cr3", ".dng", ".raf", ".rw2", ".orf"
 TRANSITIONS = {
     "pending": {"analyzing", "failed"},
     "analyzing": {"ready", "failed"},
-    "ready": {"processing", "analyzing", "failed"},
+    "ready": {"processing", "analyzing", "revision_requested", "failed"},
     "processing": {"review", "failed"},
     "review": {"revision_requested", "approved", "failed"},
     "revision_requested": {"ready", "failed"},
