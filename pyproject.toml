@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "photoflow"
+version = "0.1.0"
+description = "Local, non-destructive Codex-assisted RAW photography workflow"
+requires-python = ">=3.12"
+dependencies = [
+  "numpy>=2,<3", "rawpy>=0.25,<0.27", "Pillow>=11,<13",
+  "tifffile>=2025.1", "pydantic>=2.10,<3", "scipy>=1.14,<2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10"]
+
+[project.scripts]
+photoflow = "photoflow.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["raw: integration test requiring a real RAW sample (PHOTOFLOW_RAW_SAMPLE)"]

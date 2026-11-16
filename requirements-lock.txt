@@ -1,0 +1,16 @@
+annotated-types==0.8.0
+iniconfig==2.3.1
+numpy==2.5.5
+packaging==26.3
+pillow==12.3.0
+pluggy==1.7.0
+pydantic==2.14.3
+pydantic_core==2.50.4
+Pygments==2.21.0
+pytest==9.2.0
+rawpy==0.26.1
+scipy==1.18.1
+setuptools==84.2.1
+tifffile==2026.11.12
+typing-inspection==0.4.5
+typing_extensions==4.16.0
