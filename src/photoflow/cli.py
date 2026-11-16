@@ -52,6 +52,7 @@ def parser():
     direct.add_argument("--max-previews", type=int, choices=range(1, 7), default=3)
     direct.add_argument("--style", default="Natural Commercial Portrait")
     direct.add_argument("--mode", choices=["codex", "api"], default="codex")
+    direct.add_argument("--semantic", action="store_true", help="Run/reuse installed local semantic parsing before artistic analysis")
     direct.add_argument("--resolution", help="Record an explicit user decision to resume after an exception; never resets pass limits")
     explore = sub.add_parser("explore", help="Render a bounded reduced-resolution candidate from cached linear RAW")
     explore.add_argument("session")
@@ -64,6 +65,16 @@ def parser():
     presented = sub.add_parser("presented", help="Acknowledge actual artifact presentation, never approval")
     presented.add_argument("session")
     presented.add_argument("--method", choices=["tool_image_content", "artifact_links"], required=True)
+    segment = sub.add_parser("segment",help="Run/reuse local CPU semantic parsing; never downloads models")
+    segment.add_argument("session")
+    segment.add_argument("photo")
+    segment.add_argument("--device",choices=["cpu","auto"],default="cpu")
+    cycle = sub.add_parser("begin-cycle",help="Record explicit user authorization for new work, preserving all earlier attempts")
+    cycle.add_argument("session")
+    cycle.add_argument("photo")
+    cycle.add_argument("--by",required=True)
+    cycle.add_argument("--reason",required=True)
+    cycle.add_argument("--max-passes",type=int,choices=[1,2],default=2)
     return root
 
 
@@ -77,6 +88,11 @@ def execute(args):
             reporting.session_report(session, queue)
             return queue.model_dump(mode="json")
         workflow = Workflow(session)
+        if args.command == "segment":
+            from .segmentation import segment
+            return segment(workflow,args.photo,device=args.device)
+        if args.command == "begin-cycle":
+            return workflow.begin_cycle(args.photo,args.by,args.reason,args.max_passes)
         if args.command in {"direct", "explore", "presented"}:
             from .director import Director, DirectorConfig
             director = Director(workflow)
@@ -91,7 +107,8 @@ def execute(args):
             if args.resolution:
                 raise FlowError("Use --resolution only with --resume after the user's decision")
             return director.start(args.instruction, args.photo, DirectorConfig(
-                max_full_passes=args.max_passes, max_previews=args.max_previews, style=args.style), next_only=args.next)
+                max_full_passes=args.max_passes, max_previews=args.max_previews, style=args.style,
+                semantic=args.semantic), next_only=args.next)
         if args.command == "chat-report":
             from .chat_reporting import create_chat_report
             return create_chat_report(workflow, workflow.photo(args.photo))

@@ -82,3 +82,29 @@ ImageContent, показ зафиксирован как acknowledgement аге�
 frontend_rendering_verified=false. Markdown-файл сам по себе не доказывает
 inline-рендер разговора. Кэш, ledger, исторические версии и RAW проверяются отдельным audit.
 Доказательства и ограничения: [итоговый отчёт](./implemented_autonomous_processing.md).
+
+## Stage 2: human/face parsing
+
+Обычные `tests/test_segmentation.py` используют явно обозначенный FixtureParser.
+Они проверяют class mapping, ranges/dimensions, portrait/landscape letterbox,
+nearest labels, continuous alpha, rotation/inverse, crop, отсутствие воздействия вне
+predicted support для всех local operations, cache hit/invalidation/corruption,
+непубликацию cache после сбоя, missing regions, recipe/intersection, version provenance,
+native diagnostics и прежний approval gate. GPU fallback проверяется синтетическим
+provider fixture; реальный GPU в этой среде отсутствует.
+
+Отдельный настоящий neural test:
+
+```bash
+PHOTOFLOW_RAW_SAMPLE=sessions/portrait_01/raw/DSC03037.ARW \
+PHOTOFLOW_SEGMENTATION_MODELS=.models .venv/bin/python -m pytest -q
+```
+
+Реальный test декодирует RAW и вызывает обе локальные ONNX-модели; обычные tests
+не скачивают модели. Требуемые env отсутствуют — этот отдельный test skipped.
+Инженерная проверка Stage 2 выполнена со всеми env, без пропусков.
+
+Визуальный контроль остаётся обязательным: source input512 даёт coarse boundaries,
+а native overlay подтверждает координаты применения, не нейросетевое разрешение26Мп.
+Сравнение с ellipses — agreement с предсказанием, не ground-truth accuracy.
+Настоящие наблюдения, ресурсы и сохранность: [implemented_stage_2.md](implemented_stage_2.md).

@@ -62,8 +62,13 @@ def version_report(session, photo, version, folder=None):
                   + bullets(assessment.improvements) + "\n\nОставшиеся вопросы:\n\n"
                   + bullets(assessment.concerns) + f"\n\n{assessment.rationale}")
     masks = [f"{m.id}: эллипс {m.center}, радиусы {m.radius}, растушёвка {m.feather}. {m.description}" for m in recipe.masks]
+    masks += [f"{m.id}: semantic {m.region}, intersection={m.intersect_ellipse or 'нет'}. {m.description}" for m in recipe.semantic_masks]
     operations = [f"{a.mask}: {a.operation} = {a.amount}. {a.rationale}" for a in recipe.local_adjustments]
-    overlays = "\n\n".join(f"![Маска {m.id}](./masks/{m.id}-overlay.jpg)" for m in recipe.masks)
+    overlays = "\n\n".join(f"![Маска {m.id}](./masks/{m.id}-overlay.jpg)" for m in [*recipe.masks,*recipe.semantic_masks])
+    mask_note = (f"Семантические маски: локальная модель {recipe.segmentation.model}, cache {recipe.segmentation.cache_key}. "
+                 "[Provenance](./segmentation.json). Ellipse — отдельный художественный инструмент; "
+                 "семантические границы требуют визуальной проверки, не являются точным matting."
+                 if recipe.segmentation else "Маски — эллиптические области, выбранные AI, а не семантическая сегментация кожи/волос.")
     details = "\n\n".join(
         f"### {r.id}: {r.description}\n\n"
         f"[До](./details/{r.id}/before.jpg) · [После](./details/{r.id}/after.jpg) · "
@@ -111,7 +116,7 @@ RAW: `{recipe.raw.model_dump_json()}`. Crop: `{recipe.crop.model_dump_json()}`.
 
 {overlays}
 
-Маски — области, выбранные AI, а не семантическая сегментация кожи/волос.
+{mask_note}
 Сглаживание, если запрошено: ограниченная фильтрация с весами по перепаду яркости;
 сохранение пор требует визуальной проверки. Геометрия лица и композиция не меняются,
 кроме явно заданного crop. Автоматическое удаление родинок/шрамов отсутствует.

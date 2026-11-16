@@ -11,7 +11,7 @@ from . import __version__
 from . import imaging, queue as queues, reporting
 from .cache import RawCache
 from .models import (AIReview, DetailRegion, ExportManifest, Plan, RawSettings, Recipe, Region,
-                     RenderAttempt, RevisionRequest, SessionStyle, VersionManifest)
+                     ProcessingCycle, RenderAttempt, RevisionRequest, SessionStyle, VersionManifest)
 from .storage import (FlowError, atomic_write, checked_version, digest, json_bytes, now,
                       read_model, sync_dir, write_json)
 
@@ -25,6 +25,31 @@ class Workflow:
 
     def decoded(self, photo, settings, cache=None):
         return (cache or RawCache(self.session, self.decoder)).get(photo, settings)
+
+    def begin_cycle(self, identifier, authorized_by, reason, max_passes=2):
+        """Explicit new user-directed work; never called by automatic retry/director."""
+        photo = self.photo(identifier)
+        director_path = self.session.path("director","current.json")
+        if director_path.exists() and json.loads(director_path.read_text()).get("status") != "complete":
+            raise FlowError("Finish the existing Director run before explicitly authorizing a new cycle")
+        if photo.state not in {"review", "failed", "approved", "exported"} or photo.active_attempt_count < 1:
+            raise FlowError("A new authorized cycle requires a completed/failed previous processing cycle")
+        cycle = ProcessingCycle(start_attempt=len(photo.render_attempts),max_full_passes=max_passes,
+            authorized_by=authorized_by,reason=reason,created_at=now())
+        photo.processing_cycles.append(cycle)
+        photo.history.append({"at":now(),"event":"user_authorized_processing_cycle",**cycle.model_dump(mode="json")})
+        self.save()
+        return cycle.model_dump(mode="json")
+
+    def semantic_cache(self, photo, recipe):
+        if not recipe.semantic_masks:
+            return None
+        from .segmentation import SemanticCache
+        cache = SemanticCache(self.session,photo,recipe.segmentation.cache_key)
+        for region in recipe.semantic_masks:
+            if not cache.manifest.regions.get(region.region,{}).get("available"):
+                raise FlowError(f"Semantic region unavailable: {region.region}; inspect diagnostics")
+        return cache
 
     def photo(self, identifier):
         return queues.find(self.queue, identifier)
@@ -93,6 +118,7 @@ class Workflow:
             self.check_feedback(photo, plan.recipe)
         elif plan.recipe.feedback_sha256 is not None or plan.recipe.feedback_applied:
             raise FlowError("Initial recipe cannot claim feedback")
+        self.semantic_cache(photo,plan.recipe)
         # Keep one coherent plan as source of truth; analysis views are derived.
         write_json(self.session.work(photo.id, "plan.json"), plan)
         write_json(self.session.work(photo.id, "analysis.json"), plan.analysis)
@@ -136,6 +162,10 @@ class Workflow:
             raise FlowError("Version recipe/mask manifest mismatch")
         if recipe.detail_regions != [DetailRegion.model_validate(r) for r in manifest["detail_regions"]]:
             raise FlowError("Version recipe/detail manifest mismatch")
+        if [m.model_dump(mode="json") for m in recipe.semantic_masks] != manifest["semantic_masks"]:
+            raise FlowError("Version semantic mask manifest mismatch")
+        if (recipe.segmentation.model_dump(mode="json") if recipe.segmentation else None) != manifest["segmentation"]:
+            raise FlowError("Version segmentation manifest mismatch")
         for name in ["report.md", "feedback.md", "ai_review.json"]:
             if not self.session.work(photo.id, version, name).is_file():
                 raise FlowError(f"Mandatory version artifact missing: {name}")
@@ -154,7 +184,7 @@ class Workflow:
         photo = self.photo(identifier)
         if photo.state != "ready":
             raise FlowError("Processing requires a validated imported plan (state ready)")
-        if len(photo.render_attempts) >= photo.max_full_passes:
+        if photo.active_attempt_count >= photo.active_pass_limit:
             raise FlowError("Full-resolution pass limit reached; stop and present the best available version")
         original_photo = photo.model_copy(deep=True)
         plan = read_model(self.session.work(photo.id, "plan.json"), Plan)
@@ -169,6 +199,7 @@ class Workflow:
         if recipe.parent_version:
             self.validate_version(photo, recipe.parent_version)
             self.check_feedback(photo, recipe)
+        semantics = self.semantic_cache(photo,recipe)
         version = self.next_version(photo)
         temporary = self.session.work(photo.id, f".staging-{version}")
         destination = self.session.work(photo.id, version)
@@ -195,14 +226,19 @@ class Workflow:
             write_json(temporary / "decoder.json", decoded.metadata)
             style = read_model(self.session.path("session_style.json"), SessionStyle)
             write_json(temporary / "session_style.json", style)
-            result = imaging.process_pixels(decoded.pixels, recipe, temporary / "masks")
+            if semantics:
+                if decoded.metadata["oriented_dimensions"] != semantics.manifest.dimensions:
+                    raise FlowError("Segmentation/RAW oriented dimensions mismatch")
+                write_json(temporary / "segmentation.json",semantics.manifest)
+            result = imaging.process_pixels(decoded.pixels, recipe, temporary / "masks",semantic_provider=semantics)
             before = imaging.crop_image(baseline.pixels, recipe.crop)
             measures = {"before": imaging.metrics(before), "after": imaging.metrics(result)}
             measures.update(imaging.save_previews(before, result, temporary))
             measures["details"] = imaging.save_details(before, result, baseline.pixels.shape, recipe, temporary)
             measures["performance"] = {"elapsed_before_publish_seconds": perf_counter() - started,
-                                       "raw_cache": cache.events, "full_pass": len(photo.render_attempts),
-                                       "max_full_passes": photo.max_full_passes}
+                                       "raw_cache": cache.events, "full_pass": photo.active_attempt_count,
+                                       "max_full_passes": photo.active_pass_limit,
+                                       "lifetime_attempts": len(photo.render_attempts)}
             write_json(temporary / "metrics.json", measures)
             reporting.text(temporary / "feedback.md", f"# Обратная связь — {photo.filename} {version}\n\nStatus: review\n\n## Запрошенные изменения\n\n")
             write_json(temporary / "ai_review.json", {"status": "awaiting_codex_visual_review"})
@@ -220,6 +256,8 @@ class Workflow:
                         "engine_version": __version__, "libraries": imaging.runtime_versions(),
                         "ai": {"provider": plan.analysis.provider, "model": plan.analysis.model},
                         "masks": [m.model_dump() for m in recipe.masks], "created_at": now(),
+                        "semantic_masks": [m.model_dump() for m in recipe.semantic_masks],
+                        "segmentation": recipe.segmentation.model_dump() if recipe.segmentation else None,
                         "detail_regions": [r.model_dump() for r in recipe.detail_regions],
                         "artifacts": artifacts, "mutable_artifacts": sorted(mutable - {"manifest.json"})}
             write_json(temporary / "manifest.json", VersionManifest.model_validate_json(json.dumps(manifest)))
@@ -351,7 +389,7 @@ class Workflow:
         try:
             source = self.session.source(photo)
             decoded = self.decoded(photo, recipe.raw)
-            result = imaging.process_pixels(decoded.pixels, recipe)
+            result = imaging.process_pixels(decoded.pixels, recipe,semantic_provider=self.semantic_cache(photo,recipe))
             validation = imaging.export_pixels(result, staging / names[0], staging / names[1], recipe.output.jpeg_quality)
             self.session.source(photo)
             export_manifest = {"schema_version": 1, "photo_id": photo.id, "source_sha256": photo.source_sha256,

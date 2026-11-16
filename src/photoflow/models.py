@@ -64,6 +64,24 @@ class Region(StrictModel):
     description: Text
 
 
+SemanticName = Literal["person", "background", "face", "face_skin", "hair", "skin",
+                       "upper_clothing", "lower_clothing", "dress", "eyes", "lips"]
+
+
+class SemanticRegion(StrictModel):
+    """Model-derived region, optionally intersected with an artistic ellipse."""
+    id: Identifier
+    kind: Literal["semantic"] = "semantic"
+    region: SemanticName
+    intersect_ellipse: Identifier | None = None
+    description: Text
+
+
+class SegmentationSettings(StrictModel):
+    cache_key: Checksum
+    model: Literal["schp-atr-bisenet-r18-v1"] = "schp-atr-bisenet-r18-v1"
+
+
 class LocalAdjustment(StrictModel):
     mask: Identifier
     operation: Literal["exposure", "redness", "saturation", "sharpen", "smooth"]
@@ -116,6 +134,8 @@ class Recipe(StrictModel):
     raw: RawSettings = RawSettings()
     global_adjustments: GlobalAdjustments = GlobalAdjustments()
     masks: Annotated[list[Region], Field(max_length=32)] = []
+    semantic_masks: Annotated[list[SemanticRegion], Field(max_length=32)] = []
+    segmentation: SegmentationSettings | None = None
     local_adjustments: Annotated[list[LocalAdjustment], Field(max_length=64)] = []
     detail_regions: Annotated[list[DetailRegion], Field(max_length=12)] = []
     crop: Crop = Crop()
@@ -127,11 +147,16 @@ class Recipe(StrictModel):
 
     @model_validator(mode="after")
     def mask_references(self):
-        ids = [m.id for m in self.masks]
+        ellipse_ids = [m.id for m in self.masks]
+        ids = ellipse_ids + [m.id for m in self.semantic_masks]
         if len(set(ids)) != len(ids):
             raise ValueError("duplicate mask IDs")
         if any(a.mask not in ids for a in self.local_adjustments):
             raise ValueError("local adjustment references unknown mask")
+        if bool(self.semantic_masks) != (self.segmentation is not None):
+            raise ValueError("semantic masks require an explicit segmentation cache binding")
+        if any(m.intersect_ellipse and m.intersect_ellipse not in ellipse_ids for m in self.semantic_masks):
+            raise ValueError("semantic intersection references unknown ellipse")
         detail_ids = [region.id for region in self.detail_regions]
         if len(set(detail_ids)) != len(detail_ids):
             raise ValueError("duplicate detail region IDs")
@@ -179,7 +204,7 @@ class CorrectionRecommendation(StrictModel):
     expected_improvement: Text
     side_effects: list[Text]
     verification: Text
-    adjustment_paths: Annotated[list[Annotated[str, Field(pattern=r"^(?:global_adjustments\.(?:exposure_ev|highlights|shadows|black_point|white_point|contrast|saturation|vibrance|channel_gains|tone_curve|sharpen|denoise)|raw\.(?:white_balance|multipliers|highlight_mode)|masks|local_adjustments|crop)$")]], Field(min_length=1)]
+    adjustment_paths: Annotated[list[Annotated[str, Field(pattern=r"^(?:global_adjustments\.(?:exposure_ev|highlights|shadows|black_point|white_point|contrast|saturation|vibrance|channel_gains|tone_curve|sharpen|denoise)|raw\.(?:white_balance|multipliers|highlight_mode)|masks|semantic_masks|segmentation|local_adjustments|crop)$")]], Field(min_length=1)]
 
 
 class AIReview(StrictModel):
@@ -211,6 +236,14 @@ class RenderAttempt(StrictModel):
     reason: str | None = None
 
 
+class ProcessingCycle(StrictModel):
+    start_attempt: Annotated[int, Field(ge=0)]
+    max_full_passes: Literal[1, 2]
+    authorized_by: Text
+    reason: Text
+    created_at: Text
+
+
 class RevisionRequest(StrictModel):
     parent_version: Version
     feedback_path: Annotated[str, Field(pattern=r"^(?:v[0-9]{3,}/feedback\.md|revision_requests/[0-9a-f]{32}\.md)$")]
@@ -233,6 +266,7 @@ class Photo(StrictModel):
     revision_request: RevisionRequest | None = None
     max_full_passes: Literal[1, 2] = 2
     render_attempts: list[RenderAttempt] = []
+    processing_cycles: list[ProcessingCycle] = []
     selected_version: Version | None = None
     selection_rationale: str = ""
     directed: bool = False
@@ -250,7 +284,15 @@ class Photo(StrictModel):
             raise ValueError("current version is not registered")
         if self.selected_version and self.selected_version not in self.versions:
             raise ValueError("selected version is not registered")
-        if len(self.render_attempts) > self.max_full_passes:
+        if self.processing_cycles:
+            starts = [cycle.start_attempt for cycle in self.processing_cycles]
+            if starts != sorted(set(starts)) or starts[0] < 1 or starts[-1] > len(self.render_attempts):
+                raise ValueError("invalid processing cycle audit boundaries")
+            boundaries = [0, *starts, len(self.render_attempts)]
+            limits = [self.max_full_passes, *[c.max_full_passes for c in self.processing_cycles]]
+            if any(b-a > limit for a,b,limit in zip(boundaries,boundaries[1:],limits)):
+                raise ValueError("full-resolution pass limit exceeded")
+        elif len(self.render_attempts) > self.max_full_passes:
             raise ValueError("full-resolution pass limit exceeded")
         if len({a.version for a in self.render_attempts}) != len(self.render_attempts):
             raise ValueError("duplicate render attempts")
@@ -263,6 +305,14 @@ class Photo(StrictModel):
         ]):
             raise ValueError("approval provenance missing")
         return self
+
+    @property
+    def active_attempt_count(self):
+        return len(self.render_attempts) - (self.processing_cycles[-1].start_attempt if self.processing_cycles else 0)
+
+    @property
+    def active_pass_limit(self):
+        return self.processing_cycles[-1].max_full_passes if self.processing_cycles else self.max_full_passes
 
 
 class Queue(StrictModel):
@@ -304,6 +354,8 @@ class VersionManifest(StrictModel):
     libraries: dict
     ai: dict[str, str]
     masks: list[Region]
+    semantic_masks: list[SemanticRegion] = []
+    segmentation: SegmentationSettings | None = None
     detail_regions: list[DetailRegion] = []
     created_at: Text
     artifacts: dict[str, Checksum]
@@ -318,6 +370,12 @@ class VersionManifest(StrictModel):
         for mask in self.masks:
             if not {f"masks/{mask.id}.npy", f"masks/{mask.id}-overlay.jpg"} <= self.artifacts.keys():
                 raise ValueError("Version manifest is missing mask artifacts")
+        if self.semantic_masks:
+            if not self.segmentation or "segmentation.json" not in self.artifacts:
+                raise ValueError("Version manifest is missing segmentation provenance")
+            for mask in self.semantic_masks:
+                if f"masks/{mask.id}-overlay.jpg" not in self.artifacts:
+                    raise ValueError("Version manifest is missing semantic mask overlay")
         for region in self.detail_regions:
             required_detail = {f"details/{region.id}/{name}" for name in
                                ["before.jpg", "after.jpg", "before_after.jpg", "region.json"]}

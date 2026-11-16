@@ -14,6 +14,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<10"]
+segmentation = ["onnxruntime==1.23.2"]
 
 [project.scripts]
 photoflow = "photoflow.cli:main"

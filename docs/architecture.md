@@ -98,3 +98,22 @@ Crash после публикации версии или review до обнов
 цикл; обычный review результат не требует approval для продолжения batch.
 Python не делает vision API вызовов и не запускает новый разговор. Mode A требует
 живого Codex-агента; для unattended Mode B нужны отдельная реализация и opt-in.
+
+## Stage 2: локальный parsing
+
+`segmentation.py` отделяет LocalParser (проверенные ONNX, RGB/BGR, letterbox,
+автоматические face crops и roll normalization) от SemanticCache, region mapping,
+guided alpha и visual diagnostics. Runtime не загружает PyTorch и не делает сетевых
+запросов. Подготовка закреплённого SCHP ONNX — отдельный installation script.
+
+Стабильные имена регионов не зависят от class IDs. Recipe/VersionManifest расширены
+необязательными semantic_masks и segmentation, прежние рецепты по-прежнему валидны.
+Workflow проверяет source/cache до выполнения; imaging получает validated provider
+и применяет alpha до итогового crop. Director передаёт диагностику Codex, требует
+review применённых overlays; chat bundle включает реальные semantic images.
+
+Явный новый запрос пользователя может создать ProcessingCycle после завершения
+прежнего run. Он добавляет границу в append-only render_attempts, author/reason/time,
+не удаляя прошлые попытки. В каждом цикле максимум два. start/resume/retry не создают
+цикл автоматически: CLI begin-cycle — такая же агентная граница доверия, как approve,
+с обязательной реальной пользовательской авторизацией в разговоре.

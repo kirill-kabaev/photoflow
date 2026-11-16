@@ -31,3 +31,5 @@ sessions/*
 *.SRW
 .photoflow-git/
 *.bundle
+
+.models/

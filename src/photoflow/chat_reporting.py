@@ -64,6 +64,7 @@ def create_chat_report(workflow, photo):
         raise FlowError("Selection does not match the latest visual AI decision")
     relatives = ["before.jpg", "after.jpg", "before_after.jpg"]
     relatives += [f"details/{r.id}/before_after.jpg" for r in recipe.detail_regions]
+    relatives += [f"masks/{r.id}-overlay.jpg" for r in recipe.semantic_masks]
     directory = workflow.session.work(photo.id, "chat_reports", uuid.uuid4().hex)
     directory.mkdir(parents=True)
     report = ChatReport(photo_id=photo.id, filename=photo.filename, session=workflow.session.root.name,

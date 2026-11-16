@@ -66,7 +66,7 @@ local_adjustments. Маски создаются по одной для огра
 
 Нет геометрической реконструкции, генеративной дорисовки или автоматического healing.
 Эллипсы могут задевать волосы/губы: Codex обязан осмотреть overlays. Качество пор
-проверяется при 100%, а не по общим метрикам. Семантическая модель — следующий этап.
+проверяется при 100%, а не по общим метрикам. Stage 2 добавляет semantic masks ниже.
 
 ## Crop, previews и экспорт
 
@@ -136,3 +136,29 @@ Explore сначала уменьшает проверенные linear pixels (
 дополнительный полноразмерный рендер для этой проверки не запускался.
 RenderAttempt резервируется до полного прохода, максимум два; прерывание не
 возвращает слот. Исторические версии и full-resolution outputs не заменяются cache.
+
+## Semantic masks Stage 2
+
+Модель получает sRGB preview из нейтрального linear RAW после штатной ориентации
+LibRaw; отдельный preview EV входит в cache identity. Модельный letterbox 512 сохраняет
+aspect ratio. Удаление padding, перевод дискретных labels и alpha описаны в
+[semantic_segmentation.md](semantic_segmentation.md). EXIF flip второй раз не применяется.
+
+Recipe содержит отдельные `semantic_masks` и binding `segmentation.cache_key`.
+Они используют те же local operations, что ellipse: exposure, saturation, redness,
+sharpen, smooth. Новые глобальные формулы не добавлены. Операции сначала выполняются
+на ellipses в прежнем порядке, затем на semantic masks в порядке их списка.
+`intersect_ellipse` умножает model alpha на художественный градиент. Перекрытие
+face и face_skin может намеренно суммировать EV; это явно записывается в recipe.
+
+Alpha создаётся из общей low-resolution float32 cache по одной области на полный
+RAW; Bilinear применяется к float alpha, Nearest — к predicted support. После resize
+alpha ограничена support, поэтому движок не меняет пиксели вне выбранной моделью
+области. Ошибки самих предсказанных границ этим не устраняются.
+Image-guided filter с малым радиусом формирует только внутренний переход, без
+широкого outward feather. Это не маттинг отдельных волос и не ретушь текстуры.
+
+Полные semantic arrays не дублируются в каждой версии. Версия сохраняет cache binding,
+segmentation.json с моделью/весами/конфигурацией/хешами, применённые overlays и
+обычный manifest. При потере/повреждении cache выполнение/экспорт завершается явной
+ошибкой; нет молчаливого ellipse fallback. Кэш нужен для дальнейшей воспроизводимости.

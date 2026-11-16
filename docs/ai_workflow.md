@@ -9,6 +9,7 @@ Mode A — основной режим: Codex видит изображения,
 
 ```bash
 photoflow direct SESSION --next
+photoflow direct SESSION --photo PHOTO_ID --semantic
 photoflow direct SESSION --photo PHOTO_ID
 photoflow direct SESSION --batch
 photoflow direct SESSION --resume
@@ -57,6 +58,12 @@ parent, style и schema проверяются до выполнения, а н�
 Новые run и ветви не обходят лимит. Старые версии до введения счётчика сохранены
 и не учитываются задним числом. Автоматического сброса бюджета нет; после исчерпания
 нужно остановиться и обсудить ограничение с пользователем, не расширять max тайно.
+Stage 2 добавляет только явный `begin-cycle --by USER --reason REQUEST` для нового
+прямо запрошенного этапа после завершения предыдущего run. Полный render_attempts
+остаётся append-only; processing_cycles фиксирует границы и разрешение. Лимит 1–2
+проверяется внутри каждого цикла, lifetime attempts также показываются в metrics.
+Director/retry/resolution не открывают новые циклы. Для DSC03037 таким разрешением
+стал прямой запрос пользователя создать новую semantic RAW-версию Stage 2.
 Delivery export после отдельного user approval не является художественным проходом:
 он заново воспроизводит тот же одобренный рецепт из RAW, как требует Master Plan.
 
@@ -122,4 +129,17 @@ Mode A работает в активной беседе. По завершен�
 Mode B API не реализован и не нужен для Mode A; --mode api даёт явную ошибку, без upload.
 Будущий provider должен выдавать существующие строгие Plan/AIReview через этот протокол,
 с opt-in, секретами из окружения, лимитами запросов/стоимости и bounded retries.
-Семантических skin/hair моделей нет; эллипсы маркируются именно пространственными масками.
+Stage 2 реализует локальный SCHP/BiSeNet adapter; генеративной ретуши нет.
+
+## Semantic analysis и review
+
+`direct --semantic` выполняет/переиспользует segmentation перед analyze_and_plan и
+возвращает cache_key, доступные регионы, coverage, warnings и настоящие overlays.
+Codex выбирает semantic_masks по имени; привычные LocalAdjustment действуют через
+их ID. Ellipse остаётся отдельным опциональным градиентом или intersection.
+Отсутствующие области не получают выдуманных масок.
+
+Recipe фиксирует segmentation binding, version сохраняет segmentation.json и
+overlays применённых alpha; review требует их фактические SHA. Chat bundle включает
+semantic overlays. Маски применяются в oriented uncropped RAW coordinates до crop.
+Подробности установки/ограничений: [semantic_segmentation.md](semantic_segmentation.md).

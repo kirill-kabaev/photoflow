@@ -24,6 +24,7 @@ class DirectorConfig(StrictModel):
     max_full_passes: Literal[1, 2] = 2
     max_previews: Annotated[int, Field(ge=1, le=6)] = 3
     style: Text = "Natural Commercial Portrait"
+    semantic: bool = False
 
 
 class DirectorRun(StrictModel):
@@ -52,7 +53,7 @@ def changed_adjustments(before, after):
         for key, value in getattr(before, group).model_dump().items():
             if value != getattr(after, group).model_dump()[key]:
                 changed.add(f"{group}.{key}")
-    for key in ["masks", "local_adjustments", "crop"]:
+    for key in ["masks", "semantic_masks", "segmentation", "local_adjustments", "crop"]:
         if getattr(before, key) != getattr(after, key):
             changed.add(key)
     return changed
@@ -82,13 +83,16 @@ def review_context(workflow, photo):
     required = {f"{photo.current_version}/{name}" for name in
                 ["before.jpg", "after.jpg", "before_after.jpg", "recipe.json", "metrics.json", "session_style.json"]}
     required.update(f"{photo.current_version}/details/{r.id}/before_after.jpg" for r in recipe.detail_regions)
+    if recipe.semantic_masks:
+        required.add(f"{photo.current_version}/segmentation.json")
+        required.update(f"{photo.current_version}/masks/{r.id}-overlay.jpg" for r in recipe.semantic_masks)
     return {"required_artifacts": {p: digest(workflow.session.work(photo.id, p)) for p in sorted(required)},
             "available_versions": [{"version": v, "after": str(workflow.session.work(photo.id, v, "after.jpg")),
                 "after_sha256": digest(workflow.session.work(photo.id, v, "after.jpg"))} for v in photo.versions],
             "recipe": recipe.model_dump(mode="json"),
             "metrics": json.loads((folder / "metrics.json").read_text()),
             "review_categories": sorted(REVIEW_CATEGORIES), "review_schema": AIReview.model_json_schema(),
-            "remaining_full_passes": photo.max_full_passes - len(photo.render_attempts),
+            "remaining_full_passes": photo.active_pass_limit - photo.active_attempt_count,
             "instruction": "Inspect real images/details and read recipe/style/metrics. Explicitly select best_version; newest is not necessarily best. Never approve."}
 
 
@@ -197,12 +201,15 @@ class Director:
         if photo.state in {"processing", "exporting"}:
             return {"action": "recover", "photo_id": photo.id, "instruction": "Recover interrupted operation before continuing; reserved passes remain charged."}
         if photo.id not in self.run.initialized:
-            if len(photo.render_attempts) > self.run.config.max_full_passes:
+            if photo.active_attempt_count > self.run.config.max_full_passes:
                 return self.stop(photo, "Existing pass budget already exceeds the requested lower limit")
             photo.directed = True
             photo.target_style = self.run.config.style
             # Existing versions predate this policy; attempts recorded under the policy never reset.
-            photo.max_full_passes = min(photo.max_full_passes, self.run.config.max_full_passes)
+            if photo.processing_cycles:
+                photo.processing_cycles[-1].max_full_passes = min(photo.active_pass_limit,self.run.config.max_full_passes)
+            else:
+                photo.max_full_passes = min(photo.max_full_passes, self.run.config.max_full_passes)
             self.workflow.save()
             self.run.initialized.append(photo.id)
             replan = False
@@ -219,23 +226,28 @@ class Director:
             elif replan:
                 self.workflow.prepare(photo.id)
         self.save()
-        if len(photo.render_attempts) >= photo.max_full_passes and photo.state in {"pending", "analyzing", "ready", "revision_requested"}:
+        if photo.active_attempt_count >= photo.active_pass_limit and photo.state in {"pending", "analyzing", "ready", "revision_requested"}:
             return self.stop(photo, "Full-resolution pass budget exhausted; preserve and present best available version")
         if photo.state == "pending":
             self.workflow.prepare(photo.id)
         if photo.state in {"analyzing", "revision_requested"}:
+            semantics = None
+            if self.run.config.semantic:
+                from .segmentation import segment
+                semantics = segment(self.workflow,photo.id)
             context = self.session.work(photo.id, "context.json")
             if not context.exists():
                 if photo.state == "analyzing":
                     self.workflow.prepare(photo.id)
                 else:
                     return self.stop(photo, "Original analysis inputs unavailable")
-            return {"action": "targeted_correction_plan" if photo.render_attempts else "analyze_and_plan",
+            return {"action": "targeted_correction_plan" if photo.active_attempt_count else "analyze_and_plan",
                     "photo_id": photo.id, "style": self.run.config.style,
                     "context": json.loads(context.read_text()), "analysis_categories": sorted(ANALYSIS_CATEGORIES),
                     "plan_schema": Plan.model_json_schema(),
                     "parent_version": self.workflow.revision_parent(photo),
                     "feedback": self.workflow.request_revision(photo.id) if photo.state == "revision_requested" else None,
+                    "semantic_segmentation": semantics,
                     "instruction": "Codex inspects actual RAW preview, independently creates a complete validated plan; use explore before committing to a full pass."}
         if photo.state == "ready":
             self.workflow.process(photo.id)
@@ -255,7 +267,7 @@ class Director:
         if review.intervention != "none" or review.recommendation == "manual_attention":
             return self.stop(photo, review.rationale)
         if review.recommendation == "revise":
-            if len(photo.render_attempts) >= photo.max_full_passes:
+            if photo.active_attempt_count >= photo.active_pass_limit:
                 return self.stop(photo, "Second pass still has significant defects: " + review.rationale)
             request = self.session.path("director", "requests", f"{self.run.id}-{photo.current_version}.md")
             reporting.text(request, "# AI visual correction plan\n\n" + review.model_dump_json(indent=2))
@@ -307,10 +319,12 @@ class Director:
         small = reduced(developed.pixels)
         neutral = reduced(baseline.pixels)
         scale = small.shape[1] / developed.pixels.shape[1]
-        result = imaging.process_pixels(small, plan.recipe, spatial_scale=scale)
+        result = imaging.process_pixels(small, plan.recipe, spatial_scale=scale,
+                                       semantic_provider=self.workflow.semantic_cache(photo,plan.recipe))
         imaging.save_previews(imaging.crop_image(neutral, plan.recipe.crop), result, folder)
         write_json(folder / "plan.json", plan)
-        record = {"resolution": "preview_only", "full_passes_used": len(photo.render_attempts),
+        record = {"resolution": "preview_only", "full_passes_used": photo.active_attempt_count,
+            "lifetime_attempts": len(photo.render_attempts),
             "source_dimensions": developed.metadata["oriented_dimensions"], "linear_preview_dimensions": [small.shape[1], small.shape[0]],
             "spatial_radius_scale": scale, "raw_cache": cache.events, "recipe": plan.recipe.model_dump(mode="json"),
             "measurements": imaging.metrics(result), "artifacts": {p.name: digest(p) for p in folder.iterdir() if p.is_file()}}

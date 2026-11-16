@@ -158,11 +158,13 @@ def _global_pixels(source, a, spatial_scale=1.0):
     return image
 
 
-def process_pixels(source, recipe: Recipe, mask_dir=None, preview_size=1400, spatial_scale=1.0):
+def process_pixels(source, recipe: Recipe, mask_dir=None, preview_size=1400, spatial_scale=1.0, semantic_provider=None):
     if not 0 < spatial_scale <= 1:
         raise FlowError("Spatial preview scale must be in (0, 1]")
     if source.dtype != np.float32 or source.ndim != 3 or source.shape[2] != 3 or not np.isfinite(source).all():
         raise FlowError("Engine expects finite float32 RGB pixels")
+    if recipe.semantic_masks and semantic_provider is None:
+        raise FlowError("Semantic masks require a validated segmentation cache; no ellipse fallback")
     image = np.empty_like(source, subok=False)
     # All global operators are pointwise except sigma-scaled Gaussian filters.
     # Two sequential filters require at most twice their four-sigma radius.
@@ -173,13 +175,22 @@ def process_pixels(source, recipe: Recipe, mask_dir=None, preview_size=1400, spa
         tile = _global_pixels(source[top:bottom], recipe.global_adjustments, spatial_scale)
         image[first:last] = tile[first - top:last - top]
         del tile
-    preview = to_preview(source, preview_size) if mask_dir is not None and recipe.masks else None
+    preview = to_preview(source, preview_size) if mask_dir is not None and (recipe.masks or recipe.semantic_masks) else None
     # Generate one full-resolution mask at a time to bound peak memory.
-    for region in recipe.masks:
-        mask = ellipse_mask(image.shape, region)
+    for region in [*recipe.masks, *recipe.semantic_masks]:
+        if region.kind == "ellipse":
+            mask = ellipse_mask(image.shape, region)
+        else:
+            mask = semantic_provider.mask(region.region,image.shape)
+            if region.intersect_ellipse:
+                ellipse = next(m for m in recipe.masks if m.id == region.intersect_ellipse)
+                mask *= ellipse_mask(image.shape,ellipse)
+            if mask.shape != image.shape[:2] or mask.dtype != np.float32 or not np.isfinite(mask).all() or mask.min()<0 or mask.max()>1:
+                raise FlowError("Invalid semantic mask dimensions, dtype or values")
         if mask_dir is not None:
             mask_dir.mkdir(parents=True, exist_ok=True)
-            np.save(mask_dir / f"{region.id}.npy", mask, allow_pickle=False)
+            if region.kind == "ellipse":
+                np.save(mask_dir / f"{region.id}.npy", mask, allow_pickle=False)
             small = Image.fromarray(np.uint8(np.rint(mask * 255))).resize(preview.size, Image.Resampling.BILINEAR)
             overlay = Image.new("RGB", preview.size, (255, 60, 0))
             alpha = small.point(lambda value: int(value * 0.4))
