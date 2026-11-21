@@ -327,3 +327,9 @@ RAW и по-прежнему требует отдельного одобрен�
 Для демонстрации без нового RAW-прохода существуют `skin-preview`, `spot-scan`,
 `crop-propose`; решения сохраняют `spot-decision` и `crop-decision`.
 [Результаты реализации и ограничения](docs/implemented_skin_healing_cropping.md).
+
+При новом явно разрешённом этапе `Director.supersede(actor, reason)` сохраняет
+старый незавершённый run как `superseded`, не подделывая review и не сбрасывая
+попытки. После этого `begin-cycle` создаёт отдельный аудируемый бюджет.
+`export --force ... --output-subdir NAME` сохраняет новую выдачу внутри `final/NAME/`,
+с прежними проверками и запретом перезаписи.

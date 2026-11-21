@@ -7,10 +7,10 @@ import numpy as np
 from PIL import Image
 
 from . import imaging
-from .storage import FlowError, digest, now, write_json, sync_dir
+from .storage import FlowError, checked_id, digest, now, write_json, sync_dir
 
 
-def export_saved(workflow, identifier, version, actor, reason, render_saved_recipe=False):
+def export_saved(workflow, identifier, version, actor, reason, render_saved_recipe=False, output_subdir=None):
     """Caller holds Session.lock. Permission to deliver is not artistic approval."""
     if not version or not actor or not actor.strip() or not reason or not reason.strip():
         raise FlowError('Manual export requires --force --version --by --reason')
@@ -18,8 +18,9 @@ def export_saved(workflow, identifier, version, actor, reason, render_saved_reci
     workflow.session.source(photo)
     folder,recipe,manifest=workflow.validate_version(photo,version)
     filename=f'{photo.id}.jpg'
-    destination=workflow.session.path('final',filename)
-    record=workflow.session.path('final',f'{photo.id}.manual-export.json')
+    output=workflow.session.path('final',checked_id(output_subdir)) if output_subdir is not None else workflow.session.path('final')
+    destination=workflow.session.path(str(output.relative_to(workflow.session.root)),filename)
+    record=workflow.session.path(str(output.relative_to(workflow.session.root)),f'{photo.id}.manual-export.json')
     if destination.exists() or record.exists():
         raise FlowError('Final file already exists; refusing overwrite')
     if 'full_result.npy' not in manifest['artifacts'] and not render_saved_recipe:
@@ -63,6 +64,7 @@ def export_saved(workflow, identifier, version, actor, reason, render_saved_reci
         'dimensions':[x2-x1,y2-y1],'color_space':'sRGB','jpeg_quality':recipe.output.jpeg_quality,
         'files':{filename:digest(jpeg)},'raw_reprocessed':rendered}
     write_json(staging/'manifest.json',metadata)
+    output.mkdir(parents=True,exist_ok=True)
     linked=[]
     try:
         for source,target in [(jpeg,destination),(staging/'manifest.json',record)]:

@@ -78,3 +78,18 @@ def test_explicit_recipe_replay_renders_once_without_touching_version_or_queue(w
 def test_replay_cli_requires_force(workflow):
     photo=process_first(workflow)
     assert main(['export',str(workflow.session.root),photo.id,'--render-saved-recipe'])==1
+
+
+def test_separate_delivery_folder_preserves_previous_jpeg(workflow):
+    from photoflow.storage import digest
+    photo=process_first(workflow)
+    old=export_saved(workflow,photo.id,'v001','user','Original delivery')['files'][0]
+    from pathlib import Path
+    checksum=digest(Path(old))
+    new=export_saved(workflow,photo.id,'v001','user','New delivery',output_subdir='raw_sync_test')
+    assert Path(new['files'][0]).parent.name=='raw_sync_test'
+    assert digest(Path(old))==checksum
+    with pytest.raises(FlowError,match='overwrite'):
+        export_saved(workflow,photo.id,'v001','user','New delivery',output_subdir='raw_sync_test')
+    with pytest.raises(FlowError,match='identifier'):
+        export_saved(workflow,photo.id,'v001','user','New delivery',output_subdir='../escape')

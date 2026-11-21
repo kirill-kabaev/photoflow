@@ -37,7 +37,7 @@ class DirectorRun(StrictModel):
     completed: list[Identifier] = []
     active: Identifier | None = None
     baseline_versions: dict[str, list[str]] = {}
-    status: Literal["active", "complete", "intervention"] = "active"
+    status: Literal["active", "complete", "intervention", "superseded"] = "active"
     reason: str | None = None
     pending_bundle: str | None = None
     preview_ids: dict[str, list[str]] = {}
@@ -149,7 +149,7 @@ class Director:
         write_json(self.session.path("director", "history", f"{self.run.id}.json"), validated)
 
     def start(self, instruction, photo_id=None, config=None, next_only=False):
-        if self.run and self.run.status != "complete":
+        if self.run and self.run.status not in {"complete", "superseded"}:
             raise FlowError("A director run already exists; resume it instead of resetting its budgets")
         if photo_id:
             ids = [self.workflow.photo(photo_id).id]
@@ -164,6 +164,18 @@ class Director:
             created_at=now(), updated_at=now())
         self.save()
         return self.advance()
+
+    def supersede(self, actor, reason):
+        """Explicit new user direction, never a fabricated review/completion."""
+        if not self.run or self.run.status not in {'active','intervention'} or not actor.strip() or not reason.strip():
+            raise FlowError('Superseding a run requires explicit user provenance and an unfinished run')
+        if any(p.state in {'processing','exporting'} for p in self.workflow.queue.photos):
+            raise FlowError('Recover or finish in-flight operations before superseding a run')
+        self.run.events.append({'event':'user_superseded_run','previous_status':self.run.status,
+                                'by':actor,'reason':reason,'at':now()})
+        self.run.status,self.run.reason='superseded',reason
+        self.save()
+        return {'action':'superseded','run_id':self.run.id,'approved':False}
 
     def stop(self, photo, reason):
         self.run.status, self.run.reason = "intervention", reason
@@ -199,6 +211,8 @@ class Director:
     def _advance(self):
         if self.run is None:
             raise FlowError("Start a director run first")
+        if self.run.status == 'superseded':
+            return {'action':'superseded','reason':self.run.reason,'instruction':'This run was replaced by explicit user direction; it performs no further work.'}
         if self.run.status == "intervention":
             bundle = json.loads(self.session.path(self.run.pending_bundle).read_text()) if self.run.pending_bundle else None
             return {"action": "requires_user_input", "reason": self.run.reason, "photo_id": self.run.active, "bundle": bundle}

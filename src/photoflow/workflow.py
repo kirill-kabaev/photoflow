@@ -30,7 +30,7 @@ class Workflow:
         """Explicit new user-directed work; never called by automatic retry/director."""
         photo = self.photo(identifier)
         director_path = self.session.path("director","current.json")
-        if director_path.exists() and json.loads(director_path.read_text()).get("status") != "complete":
+        if director_path.exists() and json.loads(director_path.read_text()).get("status") not in {"complete","superseded"}:
             raise FlowError("Finish the existing Director run before explicitly authorizing a new cycle")
         if photo.state not in {"review", "failed", "approved", "exported"} or photo.active_attempt_count < 1:
             raise FlowError("A new authorized cycle requires a completed/failed previous processing cycle")
