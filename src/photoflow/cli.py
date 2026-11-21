@@ -36,6 +36,7 @@ def parser():
             command.add_argument('--force',action='store_true',help='Explicit manual JPEG export from saved full-resolution result; no AI review or approval implied')
             command.add_argument('--render-saved-recipe',action='store_true',help='With --force only: replay the unchanged saved recipe from RAW if no developed result exists')
             command.add_argument('--output-subdir',help='With --force only: a new delivery folder inside final/; existing files are never overwritten')
+            command.add_argument('--jpeg-quality',type=int,choices=range(90,101),metavar='90..100',help='With --force only: delivery JPEG quality override; saved recipe stays unchanged')
             command.add_argument('--version')
             command.add_argument('--by')
             command.add_argument('--reason')
@@ -216,8 +217,8 @@ def execute(args):
         if args.command == "export":
             if args.force:
                 from .manual_export import export_saved
-                return export_saved(workflow,args.photo,args.version,args.by,args.reason,args.render_saved_recipe,args.output_subdir)
-            if args.version or args.by or args.reason or args.render_saved_recipe or args.output_subdir:
+                return export_saved(workflow,args.photo,args.version,args.by,args.reason,args.render_saved_recipe,args.output_subdir,args.jpeg_quality)
+            if args.version or args.by or args.reason or args.render_saved_recipe or args.output_subdir or args.jpeg_quality is not None:
                 raise FlowError('Manual export parameters require --force')
             return workflow.export(args.photo)
         if args.command == "priority":

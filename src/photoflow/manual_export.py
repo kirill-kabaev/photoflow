@@ -10,13 +10,16 @@ from . import imaging
 from .storage import FlowError, checked_id, digest, now, write_json, sync_dir
 
 
-def export_saved(workflow, identifier, version, actor, reason, render_saved_recipe=False, output_subdir=None):
+def export_saved(workflow, identifier, version, actor, reason, render_saved_recipe=False, output_subdir=None, jpeg_quality=None):
     """Caller holds Session.lock. Permission to deliver is not artistic approval."""
     if not version or not actor or not actor.strip() or not reason or not reason.strip():
         raise FlowError('Manual export requires --force --version --by --reason')
+    if jpeg_quality is not None and (type(jpeg_quality) is not int or not 90 <= jpeg_quality <= 100):
+        raise FlowError('JPEG quality must be an integer in [90, 100]')
     photo=workflow.photo(identifier)
     workflow.session.source(photo)
     folder,recipe,manifest=workflow.validate_version(photo,version)
+    quality=recipe.output.jpeg_quality if jpeg_quality is None else jpeg_quality
     filename=f'{photo.id}.jpg'
     output=workflow.session.path('final',checked_id(output_subdir)) if output_subdir is not None else workflow.session.path('final')
     destination=workflow.session.path(str(output.relative_to(workflow.session.root)),filename)
@@ -50,7 +53,7 @@ def export_saved(workflow, identifier, version, actor, reason, render_saved_reci
         raise FlowError('Saved developed pixels have invalid native dimensions/dtype/values')
     jpeg=staging/filename
     Image.fromarray(np.uint8(np.rint(imaging.encode_srgb(pixels)*255))).save(
-        jpeg,quality=recipe.output.jpeg_quality,subsampling=0,icc_profile=imaging.srgb_profile())
+        jpeg,quality=quality,subsampling=0,icc_profile=imaging.srgb_profile())
     with Image.open(jpeg) as test:
         test.load()
         if test.size!=(x2-x1,y2-y1) or test.mode!='RGB':
@@ -61,8 +64,10 @@ def export_saved(workflow, identifier, version, actor, reason, render_saved_reci
         'authorized_by':actor,'reason':reason,'created_at':now(),'photo_id':photo.id,
         'source_version':version,'source_sha256':photo.source_sha256,
         'recipe_sha256':manifest['recipe_sha256'],'processed_pixels_sha256':pixels_checksum,
-        'dimensions':[x2-x1,y2-y1],'color_space':'sRGB','jpeg_quality':recipe.output.jpeg_quality,
+        'dimensions':[x2-x1,y2-y1],'color_space':'sRGB','jpeg_quality':quality,
         'files':{filename:digest(jpeg)},'raw_reprocessed':rendered}
+    if jpeg_quality is not None:
+        metadata['recipe_jpeg_quality']=recipe.output.jpeg_quality
     write_json(staging/'manifest.json',metadata)
     output.mkdir(parents=True,exist_ok=True)
     linked=[]

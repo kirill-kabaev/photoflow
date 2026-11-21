@@ -93,3 +93,43 @@ def test_separate_delivery_folder_preserves_previous_jpeg(workflow):
         export_saved(workflow,photo.id,'v001','user','New delivery',output_subdir='raw_sync_test')
     with pytest.raises(FlowError,match='identifier'):
         export_saved(workflow,photo.id,'v001','user','New delivery',output_subdir='../escape')
+
+
+def test_max_quality_cli_preserves_recipe_queue_and_prior_delivery(workflow,monkeypatch):
+    from pathlib import Path
+    from PIL.JpegImagePlugin import get_sampling
+    from photoflow import imaging
+    from photoflow.storage import digest
+    photo=process_first(workflow)
+    original=Path(export_saved(workflow,photo.id,'v001','user','Original delivery')['files'][0])
+    old_hash=digest(original)
+    folder=workflow.session.work(photo.id,'v001')
+    snapshot={p.name:p.read_bytes() for p in folder.iterdir() if p.is_file()}
+    queue=workflow.session.path('queue.json').read_bytes()
+    monkeypatch.setattr(imaging,'decode_raw',lambda *_:pytest.fail('No RAW decode allowed'))
+    monkeypatch.setattr(imaging,'process_pixels',lambda *_,**kw:pytest.fail('No reprocessing allowed'))
+    args=['export',str(workflow.session.root),photo.id,'--jpeg-quality','100']
+    assert main(args)==1  # Normal approval requirements remain in force.
+    assert main(args+['--force','--version','v001','--by','user','--reason','Maximum quality delivery','--output-subdir','maximum_quality'])==0
+    output=workflow.session.path('final','maximum_quality',photo.id+'.jpg')
+    with Image.open(output) as jpeg:
+        jpeg.load()
+        assert jpeg.size==(120,80) and get_sampling(jpeg)==0
+        assert all(value==1 for table in jpeg.quantization.values() for value in table)
+        imaging.validate_srgb_profile(jpeg.info['icc_profile'])
+    record=json.loads(output.with_suffix('.manual-export.json').read_text())
+    assert record['jpeg_quality']==100 and record['recipe_jpeg_quality']==95
+    assert not record['raw_reprocessed'] and not record['artistically_approved']
+    assert {p.name:p.read_bytes() for p in folder.iterdir() if p.is_file()}==snapshot
+    assert workflow.session.path('queue.json').read_bytes()==queue
+    assert digest(original)==old_hash
+    with pytest.raises(FlowError,match='overwrite'):
+        export_saved(workflow,photo.id,'v001','user','Maximum quality delivery',output_subdir='maximum_quality',jpeg_quality=100)
+
+
+@pytest.mark.parametrize('quality',[89,101,95.5,True])
+def test_manual_quality_override_rejects_invalid_values(workflow,quality):
+    photo=process_first(workflow)
+    with pytest.raises(FlowError,match='JPEG quality'):
+        export_saved(workflow,photo.id,'v001','user','Explicit delivery',jpeg_quality=quality)
+    assert not list(workflow.session.path('final').iterdir())
