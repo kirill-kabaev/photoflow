@@ -1,5 +1,6 @@
 """Synthetic composition handoff; no fixture is claimed as real visual AI."""
 import json
+import shutil
 
 import numpy as np
 import pytest
@@ -172,7 +173,26 @@ def prune_crop_source(workflow, photo):
     return folder
 
 
-def test_existing_crop_consent_survives_explicit_source_pruning_and_exports(workflow):
+def retire_metadata(workflow, photo, version='v001'):
+    source=workflow.session.work(photo.id,version)
+    folder=workflow.session.path('cleanup_logs','retired_versions',photo.id,version)
+    folder.mkdir(parents=True)
+    for path in source.rglob('*'):
+        if path.is_file() and path.suffix in {'.json','.md'}:
+            target=folder/path.relative_to(source)
+            target.parent.mkdir(parents=True,exist_ok=True)
+            shutil.copy2(path,target)
+    record={'schema_version':1,'photo_id':photo.id,'version':version,
+        'source_sha256':photo.source_sha256,'user_request':'Synthetic explicit retirement',
+        'original_directory':str(source.relative_to(workflow.session.root)),
+        'metadata_artifacts':{str(p.relative_to(folder)):digest(p) for p in folder.rglob('*') if p.is_file()}}
+    write_json(folder/'retired_version.json',record)
+    shutil.rmtree(source)
+    return folder
+
+
+@pytest.mark.parametrize('retired',[False,True])
+def test_existing_crop_consent_survives_explicit_source_pruning_and_exports(workflow,retired):
     photo=process_first(workflow)
     proposal=cropping.propose(workflow,analysis(workflow,photo,'v001'))
     selected=approve(workflow,photo,proposal)
@@ -183,19 +203,44 @@ def test_existing_crop_consent_survives_explicit_source_pruning_and_exports(work
     workflow.import_plan(photo.id,path); workflow.process(photo.id)
     _,recipe,_=workflow.validate_version(photo,'v002')
     folder=prune_crop_source(workflow,photo)
+    if retired: retire_metadata(workflow,photo)
     queue_before=workflow.session.path('queue.json').read_bytes()
     assert cropping.authorization(workflow,photo,recipe).name==proposal['request_id']
     assert workflow.session.path('queue.json').read_bytes()==queue_before
     # The exception only verifies existing consent; it never admits a missing
     # image as a complete version, a visual input, or a new crop decision.
-    with pytest.raises(FileNotFoundError): workflow.validate_version(photo,'v001')
-    with pytest.raises(FileNotFoundError): cropping.inputs(workflow,photo,'v001')
-    with pytest.raises(FileNotFoundError): approve(workflow,photo,proposal)
+    with pytest.raises((FileNotFoundError,FlowError)): workflow.validate_version(photo,'v001')
+    with pytest.raises((FileNotFoundError,FlowError)): cropping.inputs(workflow,photo,'v001')
+    with pytest.raises((FileNotFoundError,FlowError)): approve(workflow,photo,proposal)
     import_review(workflow,photo); workflow.approve(photo.id,'v002','synthetic-user')
     result=workflow.export(photo.id)
     width,height=result['validation']['dimensions']
     assert width*16==height*9 and photo.active_attempt_count==2
     assert not (folder/'after.jpg').exists()
+
+
+@pytest.mark.parametrize('tamper',[None,'recipe','decoder','manifest','record','missing_record'])
+def test_crop_inheritance_uses_verified_retired_metadata_only(workflow,tamper):
+    photo=process_first(workflow)
+    workflow.request_revision(photo.id)
+    path=make_plan(workflow,photo,parent='v001',feedback=workflow.feedback_path(photo))
+    workflow.import_plan(photo.id,path); workflow.process(photo.id)
+    _,recipe,_=workflow.validate_version(photo,'v002')
+    folder=retire_metadata(workflow,photo)
+    if tamper in {'recipe','decoder','manifest'}: (folder/(tamper+'.json')).write_text('{}')
+    elif tamper=='record':
+        path=folder/'retired_version.json';data=json.loads(path.read_text());data['photo_id']='wrong';write_json(path,data)
+    elif tamper=='missing_record': (folder/'retired_version.json').unlink()
+    if tamper:
+        with pytest.raises(FlowError): workflow.validate_crop(photo,recipe)
+        return
+    assert workflow.validate_crop(photo,recipe) is None
+    changed=recipe.model_copy(deep=True);changed.crop=Crop(left=.1,right=.9)
+    with pytest.raises(FlowError,match='explicit user approval'): workflow.validate_crop(photo,changed)
+    with pytest.raises(FlowError,match='Missing file'): workflow.validate_version(photo,'v001')
+    import_review(workflow,photo);workflow.approve(photo.id,'v002','synthetic-user')
+    result=workflow.export(photo.id)
+    assert result['validation']['dimensions']==[120,80] and photo.active_attempt_count==2
 
 
 @pytest.mark.parametrize('tamper',[

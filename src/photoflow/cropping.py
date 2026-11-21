@@ -133,7 +133,8 @@ def _pruned_source_context(workflow, photo, analysis):
     """
     if not analysis.version:
         raise FlowError('Pruned crop source must name a historical version')
-    folder=workflow.version_folder(photo,analysis.version)
+    archived=workflow._archived_version_metadata(photo,analysis.version)
+    folder=archived[0] if archived is not None else workflow.version_folder(photo,analysis.version)
     record=json.loads((folder/'pruned_artifacts.json').read_text())
     manifest=read_model(folder/'manifest.json',VersionManifest)
     recipe=read_model(folder/'recipe.json',Recipe)
@@ -163,12 +164,18 @@ def load(workflow, photo, request_id, *, approved_crop=None):
     if approved_crop is not None and (approved_crop.request_id!=request_id
             or digest(folder/'decision.json')!=approved_crop.decision_sha256):
         raise FlowError('Crop decision differs from existing approval')
-    try:
-        context=inputs(workflow,photo,analysis.version)
-    except FileNotFoundError:
-        if approved_crop is None:
-            raise
+    archived=(workflow._archived_version_metadata(photo,analysis.version)
+              if approved_crop is not None and analysis.version else None)
+    if archived is not None:
+        workflow.session.source(photo)
         context=_pruned_source_context(workflow,photo,analysis)
+    else:
+        try:
+            context=inputs(workflow,photo,analysis.version)
+        except FileNotFoundError:
+            if approved_crop is None:
+                raise
+            context=_pruned_source_context(workflow,photo,analysis)
     identity={'analysis':analysis.model_dump(mode='json'),'dimensions':context['dimensions'],'algorithm':'integer-crop-v1'}
     if (analysis.photo_id!=photo.id or analysis.source_sha256!=photo.source_sha256
             or analysis.preview_sha256!=context['preview_sha256'] or data['dimensions']!=context['dimensions']

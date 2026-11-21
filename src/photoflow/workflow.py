@@ -84,7 +84,7 @@ class Workflow:
         from .cropping import authorization
         if recipe.approved_crop:
             return authorization(self,photo,recipe)
-        previous = self.validate_version(photo,recipe.parent_version)[1] if recipe.parent_version else None
+        previous = self._crop_reference(photo,recipe.parent_version)[1] if recipe.parent_version else None
         if recipe.crop != (previous.crop if previous else Crop()):
             raise FlowError('A new crop requires explicit user approval of 16:9 or 9:16')
         if previous and previous.approved_crop:
@@ -184,6 +184,43 @@ class Workflow:
         if version not in photo.versions:
             raise FlowError("Version is not registered")
         return self.session.work(photo.id, version)
+
+    def _archived_version_metadata(self, photo, version):
+        """Read explicitly retired metadata only; never validate archived pixels."""
+        original = self.version_folder(photo, version)
+        if original.exists():
+            return None
+        folder = self.session.path('cleanup_logs', 'retired_versions', photo.id, version)
+        record_path = self.session.path(str(folder.relative_to(self.session.root)), 'retired_version.json')
+        if not record_path.is_file():
+            return None
+        record = json.loads(record_path.read_text())
+        if (record.get('schema_version') != 1 or record.get('photo_id') != photo.id
+                or record.get('version') != version or record.get('source_sha256') != photo.source_sha256
+                or not record.get('user_request', '').strip()
+                or record.get('original_directory') != str(original.relative_to(self.session.root))):
+            raise FlowError('Retired version metadata identity changed')
+        artifacts = record.get('metadata_artifacts', {})
+        if not {'manifest.json', 'recipe.json', 'decoder.json'} <= artifacts.keys():
+            raise FlowError('Retired version metadata is incomplete')
+        for relative, checksum in artifacts.items():
+            path = self.session.path(str(folder.relative_to(self.session.root)), relative)
+            if digest(path) != checksum:
+                raise FlowError(f'Retired version metadata changed: {relative}')
+        manifest = read_model(folder / 'manifest.json', VersionManifest).model_dump(mode='json')
+        recipe = read_model(folder / 'recipe.json', Recipe)
+        if (manifest['version'] != version or manifest['source_sha256'] != photo.source_sha256
+                or recipe.photo_id != photo.id or recipe.source_sha256 != photo.source_sha256
+                or digest(folder / 'recipe.json') != manifest['recipe_sha256']
+                or digest(folder / 'decoder.json') != manifest['artifacts'].get('decoder.json')
+                or recipe.parent_version != manifest['parent_version']):
+            raise FlowError('Retired version recipe or decoder identity changed')
+        return folder, recipe, manifest
+
+    def _crop_reference(self, photo, version):
+        # Crop inheritance needs the original recipe, not the retired image.
+        archived = self._archived_version_metadata(photo, version)
+        return archived if archived is not None else self.validate_version(photo, version)
 
     def validate_version(self, photo, version):
         folder = self.version_folder(photo, version)
