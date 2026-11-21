@@ -158,3 +158,72 @@ def test_detail_crop_boundary_uses_approved_integers_not_float_truncation(tmp_pa
     details=imaging.save_details(pixels,pixels,(h,w,3),recipe,tmp_path)
     assert details['face']['source_box']==approved.source_box
     assert details['face']['preview_dimensions']==[540,960]
+
+
+def prune_crop_source(workflow, photo):
+    """Synthetic explicit deletion, retaining the original manifest and metadata."""
+    folder=workflow.session.work(photo.id,'v001')
+    record={'schema_version':1,'photo_id':photo.id,'version':'v001',
+        'user_request':'Synthetic user explicitly deletes old photo versions',
+        'source_sha256':photo.source_sha256,'manifest_sha256':digest(folder/'manifest.json'),
+        'removed_artifacts':{'after.jpg':digest(folder/'after.jpg')}}
+    write_json(folder/'pruned_artifacts.json',record)
+    (folder/'after.jpg').unlink()
+    return folder
+
+
+def test_existing_crop_consent_survives_explicit_source_pruning_and_exports(workflow):
+    photo=process_first(workflow)
+    proposal=cropping.propose(workflow,analysis(workflow,photo,'v001'))
+    selected=approve(workflow,photo,proposal)
+    workflow.request_revision(photo.id)
+    path=make_plan(workflow,photo,parent='v001',feedback=workflow.feedback_path(photo))
+    from photoflow.models import Plan
+    write_json(path,cropping.apply_selection(Plan.model_validate_json(path.read_bytes()),selected))
+    workflow.import_plan(photo.id,path); workflow.process(photo.id)
+    _,recipe,_=workflow.validate_version(photo,'v002')
+    folder=prune_crop_source(workflow,photo)
+    queue_before=workflow.session.path('queue.json').read_bytes()
+    assert cropping.authorization(workflow,photo,recipe).name==proposal['request_id']
+    assert workflow.session.path('queue.json').read_bytes()==queue_before
+    # The exception only verifies existing consent; it never admits a missing
+    # image as a complete version, a visual input, or a new crop decision.
+    with pytest.raises(FileNotFoundError): workflow.validate_version(photo,'v001')
+    with pytest.raises(FileNotFoundError): cropping.inputs(workflow,photo,'v001')
+    with pytest.raises(FileNotFoundError): approve(workflow,photo,proposal)
+    import_review(workflow,photo); workflow.approve(photo.id,'v002','synthetic-user')
+    result=workflow.export(photo.id)
+    width,height=result['validation']['dimensions']
+    assert width*16==height*9 and photo.active_attempt_count==2
+    assert not (folder/'after.jpg').exists()
+
+
+@pytest.mark.parametrize('tamper',[
+    'missing_record','record_photo','record_source','record_manifest','record_preview',
+    'recipe','decoder','proposal_preview','decision','existing_preview','raw',
+])
+def test_pruned_source_does_not_bypass_crop_integrity(workflow,tamper):
+    photo=process_first(workflow)
+    proposal=cropping.propose(workflow,analysis(workflow,photo,'v001'))
+    selected=approve(workflow,photo,proposal)
+    recipe=Recipe.model_validate_json(open(selected['pending_recipe']).read())
+    folder=prune_crop_source(workflow,photo)
+    record_path=folder/'pruned_artifacts.json'
+    record=json.loads(record_path.read_text())
+    if tamper=='missing_record': record_path.unlink()
+    elif tamper.startswith('record_'):
+        key={'record_photo':'photo_id','record_source':'source_sha256',
+             'record_manifest':'manifest_sha256','record_preview':'removed_artifacts'}[tamper]
+        record[key]={'after.jpg':'0'*64} if key=='removed_artifacts' else '0'*64
+        write_json(record_path,record)
+    elif tamper in {'recipe','decoder'}:
+        (folder/(tamper+'.json')).write_text('{}')
+    elif tamper=='proposal_preview':
+        (cropping.directory(workflow,photo,proposal['request_id'])/'original.jpg').write_bytes(b'tampered')
+    elif tamper=='decision':
+        decision=cropping.directory(workflow,photo,proposal['request_id'])/'decision.json'
+        data=json.loads(decision.read_text()); data['user_message']='changed';write_json(decision,data)
+    elif tamper=='existing_preview': (folder/'after.jpg').write_bytes(b'tampered')
+    elif tamper=='raw': workflow.session.path('raw',photo.filename).write_bytes(b'tampered synthetic source')
+    with pytest.raises((FlowError,FileNotFoundError,ValidationError)):
+        cropping.authorization(workflow,photo,recipe)

@@ -9,7 +9,7 @@ from pydantic import Field, model_validator
 
 from . import imaging
 from .models import (ApprovedCrop, Checksum, Crop, DetailRegion, Identifier,
-                     StrictModel, Text, Unit, Version)
+                     Recipe, StrictModel, Text, Unit, Version, VersionManifest)
 from .storage import FlowError, digest, json_bytes, now, read_model, write_json
 
 Ratio = Literal['16:9','9:16']
@@ -125,11 +125,50 @@ def propose(workflow, analysis):
     return presentation(workflow,photo,request_id)
 
 
-def load(workflow, photo, request_id):
+def _pruned_source_context(workflow, photo, analysis):
+    """Verify recorded source identity for existing consent after explicit pruning.
+
+    This never supplies pixels or makes a pruned version valid for processing,
+    a new visual analysis, or a new crop decision.
+    """
+    if not analysis.version:
+        raise FlowError('Pruned crop source must name a historical version')
+    folder=workflow.version_folder(photo,analysis.version)
+    record=json.loads((folder/'pruned_artifacts.json').read_text())
+    manifest=read_model(folder/'manifest.json',VersionManifest)
+    recipe=read_model(folder/'recipe.json',Recipe)
+    preview_checksum=manifest.artifacts.get('after.jpg')
+    if (record.get('schema_version')!=1 or record.get('photo_id')!=photo.id
+            or record.get('version')!=analysis.version or not record.get('user_request','').strip()
+            or record.get('source_sha256')!=photo.source_sha256
+            or record.get('manifest_sha256')!=digest(folder/'manifest.json')
+            or record.get('removed_artifacts',{}).get('after.jpg')!=preview_checksum
+            or not preview_checksum or preview_checksum!=analysis.preview_sha256
+            or (folder/'after.jpg').exists()
+            or manifest.status!='complete' or manifest.version!=analysis.version
+            or manifest.source_sha256!=photo.source_sha256
+            or recipe.photo_id!=photo.id or recipe.source_sha256!=photo.source_sha256
+            or digest(folder/'recipe.json')!=manifest.recipe_sha256
+            or digest(folder/'decoder.json')!=manifest.artifacts.get('decoder.json')
+            or recipe.crop!=Crop() or recipe.approved_crop):
+        raise FlowError('Pruned crop source identity or deletion record changed')
+    return {'preview_sha256':preview_checksum,
+            'dimensions':json.loads((folder/'decoder.json').read_text())['oriented_dimensions']}
+
+
+def load(workflow, photo, request_id, *, approved_crop=None):
     folder=directory(workflow,photo,request_id)
     data=json.loads((folder/'proposal.json').read_text())
     analysis=CropAnalysis.model_validate(data['analysis'])
-    context=inputs(workflow,photo,analysis.version)
+    if approved_crop is not None and (approved_crop.request_id!=request_id
+            or digest(folder/'decision.json')!=approved_crop.decision_sha256):
+        raise FlowError('Crop decision differs from existing approval')
+    try:
+        context=inputs(workflow,photo,analysis.version)
+    except FileNotFoundError:
+        if approved_crop is None:
+            raise
+        context=_pruned_source_context(workflow,photo,analysis)
     identity={'analysis':analysis.model_dump(mode='json'),'dimensions':context['dimensions'],'algorithm':'integer-crop-v1'}
     if (analysis.photo_id!=photo.id or analysis.source_sha256!=photo.source_sha256
             or analysis.preview_sha256!=context['preview_sha256'] or data['dimensions']!=context['dimensions']
@@ -192,8 +231,8 @@ def decide(workflow, identifier, request_id, choice, actor, message, shown_sha25
     return selected
 
 
-def selection(workflow, photo, request_id):
-    folder,data=load(workflow,photo,request_id)
+def selection(workflow, photo, request_id, *, approved_crop=None):
+    folder,data=load(workflow,photo,request_id,approved_crop=approved_crop)
     decision=json.loads((folder/'decision.json').read_text())
     choice=decision['choice']
     if (decision['photo_id']!=photo.id or decision['request_id']!=request_id
@@ -216,8 +255,8 @@ def selection(workflow, photo, request_id):
 def authorization(workflow, photo, recipe):
     if not recipe.approved_crop:
         return None
-    folder,_=load(workflow,photo,recipe.approved_crop.request_id)
-    approved=selection(workflow,photo,recipe.approved_crop.request_id)
+    folder=directory(workflow,photo,recipe.approved_crop.request_id)
+    approved=selection(workflow,photo,recipe.approved_crop.request_id,approved_crop=recipe.approved_crop)
     if (approved['approved_crop']!=recipe.approved_crop.model_dump(mode='json')
             or approved['crop']!=recipe.crop.model_dump()):
         raise FlowError('Recipe crop differs from explicit user approval')
