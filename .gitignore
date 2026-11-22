@@ -8,7 +8,12 @@ dist/
 .env
 .env.*
 !.env.example
-sessions/*
+# Photoshoot state and generated results, wherever they are placed.
+sessions/
+session/
+raw/
+work/
+final/
 *.arw
 *.ARW
 *.cr2
@@ -33,3 +38,36 @@ sessions/*
 *.bundle
 
 .models/
+
+# Local agent/account configuration is never project source.
+.agents/
+.codex/
+.aws/
+
+# Photographs and generated raster/matrix files outside session directories.
+*.[jJ][pP][gG]
+*.[jJ][pP][eE][gG]
+*.[pP][nN][gG]
+*.[tT][iI][fF]
+*.[tT][iI][fF][fF]
+*.[hH][eE][iI][cC]
+*.[hH][eE][iI][fF]
+*.npy
+*.npz
+
+# Downloaded model weights and private key material.
+*.onnx
+*.pth
+*.pt
+*.safetensors
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local test and analysis caches.
+.coverage
+.coverage.*
+htmlcov/
+.ruff_cache/
+.mypy_cache/
